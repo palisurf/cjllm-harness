@@ -5,3 +5,4 @@ __pycache__/
 chat_cache.json
 PRIVATE_*.md
 AGENT.md
+private_tests/
