@@ -7,6 +7,26 @@ A lightweight, single-file, zero-framework Python CLI inference and search-augme
 
 ---
 
+## How `cjllm.py` Compares to the Closest Single-File & Minimal CLI Harnesses
+
+Most open-source LLM tools split into either **minimal terminal CLIs (without deep search or `vLLM` hardware tuning)** or **heavy multi-container web stacks (Open WebUI, Perplexica)**. [`cjllm.py`](./cjllm.py) sits in a niche of its own—combining the **single-file hackability** of Andrej Karpathy's `minbpe`/`llm.c` scripts, the **search-grounded synthesis** of Perplexica, and **hardware-aware `vLLM` continuous-batching / KV-cache optimization** tuned for appliances like the Tenstorrent QuietBox 2 and NVIDIA DGX Spark:
+
+| Capability | [`cjllm.py`](./cjllm.py) | `aichat` | Simon Willison's `llm` | `tgpt` | `vllm chat` |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Single-File Python Script** | **Yes** (`~2,280` LoC) | Compiled Rust crate | Multi-module Python pkg | Go binary | **Yes** (`~150` LoC) |
+| **Keyless Search-by-Default** | **Yes** (`ddgs` + `primp`) | Paid API / MCP only | Plugin required | `-w` flag (snippets only) | No |
+| **Live Finance, Weather, Buoy & HTML `<table>` Scraper** | **Yes** (4-tier + head/tail rows) | No | No | No | No |
+| **Auto Parallel Slot Map-Reduce (`2–5` Streams)** | **Yes** (`2.8×–4.2×` speedup) | No | No | No | No |
+| **KV Prefix-Cache-Aware Batch Memory (`30` pairs / `8` evict)** | **Yes** | Basic truncation | Full log | Basic truncation | Unbounded |
+| **Tokenizer Bridge (`<\|box_start\|>` / `/think` toggle)** | **Yes** (auto-probed) | Manual config | Manual | No | No |
+| **50-Line Hybrid Transient SSH Scrollback Streamer** | **Yes** | Standard ANSI redraw | Raw stdout | Standard redraw | Raw stdout |
+
+* **vs. `tgpt` / `chatblade` (Closest in Keyless Web Search):** `tgpt` and `chatblade` offer drop-in terminal chat with `-w` DuckDuckGo search, but only inject short ~150-character search snippets—lacking Yahoo Finance multi-ticker cards, 7-day weather forecasts, head+tail HTML `<table>` extraction, NOAA buoy resolution, parallel `vLLM` slot fan-out, and KV prefix-cache memory management.
+* **vs. `aichat` & Simon Willison's `llm` (Closest in Terminal REPL Ergonomics):** Both provide session persistence and Markdown rendering for `/v1/chat/completions` endpoints, but require external plugins or paid API keys for search and do not implement automatic multi-slot section-parallel decoding, `<|box_start|>` tokenizer bridging, or the 50-line hybrid transient SSH scrollback streamer.
+* **vs. `vllm chat` (Closest in Direct `vLLM` Integration):** `vllm chat` is a ~150-line single-file Python REPL shipped inside `vLLM`, with no web search, no clock skill, no rolling memory archivist, no `/think` toggle, and no per-turn `TTFT / tok/s` hardware telemetry.
+
+---
+
 ## 1. Introduction & Motivation
 
 Running frontier open-weight LLMs locally on dedicated hardware (`vLLM` on Tenstorrent Blackhole/Wormhole accelerators or NVIDIA DGX/CUDA systems) provides raw token throughput and total data privacy, but exposes a gap between **serving a model** and **having a reliable daily driver**:
