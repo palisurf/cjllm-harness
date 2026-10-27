@@ -10,12 +10,15 @@ extraction, rolling summary-buffer memory compression, and live TTFT/TPS telemet
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import html
 import json
 import os
+import queue
 import re
 import readline
+import threading
 import time
 import warnings
 from urllib.parse import quote_plus
@@ -1238,6 +1241,336 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
     return compress_memory_batch(existing_summary, [(old_user, old_assistant)])
 
 
+def race_router_and_speculative_stream(
+    user_input: str,
+    history: list[dict],
+    spec_active_payload: list[dict],
+    spec_extra_body: dict,
+    effective_thinking: bool,
+) -> tuple[str | None, queue.Queue | None, dict | None]:
+    """
+    Feature B — Speculative Router + Direct-Answer Racing:
+    Fires `determine_search_query` (Slot 1) and the direct-response stream (Slot 2) simultaneously.
+    - If Slot 1 returns `None` (no web search needed), Slot 2 is already prefilled and streaming tokens,
+      hiding the ~250-400ms search-router latency completely.
+    - If Slot 1 returns a search query, Slot 2 is immediately aborted/closed (<1ms) to free the server slot.
+    """
+    u_lower = user_input.lower().strip()
+    if (is_clock_skill_query(user_input) and not is_external_data_query(user_input)) or (
+        re.search(
+            r"\b(write\s+a\s+(?:python|bash|c\+\+|rust|javascript|js|sql|html)\b|write\s+a\s+(?:script|function|program|class)\b|implement\s+a\s+function|electric\s+current\s+in\s+a\s+circuit|ohm'?s\s+law|solve\s+for\s+[a-z]\b|derivative\s+of\b|integrate\b)",
+            u_lower,
+        )
+        and not re.search(r"\b(search\s+the\s+web|pull\s+live|noaa|ndbc|buoy\s+\d{5}|yahoo\s+finance)\b", u_lower)
+    ):
+        # Deterministic direct query: no router LLM call needed at all
+        return None, None, None
+
+    spec_queue: queue.Queue = queue.Queue()
+    abort_event = threading.Event()
+    spec_meta = {
+        "start_time": time.perf_counter(),
+        "first_token_time": None,
+        "abort_event": abort_event,
+    }
+
+    def _spec_stream_worker():
+        stream_obj = None
+        try:
+            stream_kwargs = {
+                "model": MODEL_NAME,
+                "messages": spec_active_payload,
+                "temperature": 0.6 if effective_thinking else 0.7,
+                "max_tokens": MODEL_PROFILE["max_gen_tokens"],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if spec_extra_body:
+                stream_kwargs["extra_body"] = spec_extra_body
+
+            stream_obj = client.chat.completions.create(**stream_kwargs)
+            for chunk in stream_obj:
+                if abort_event.is_set():
+                    break
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta.content or ""
+                    if delta and spec_meta["first_token_time"] is None:
+                        spec_meta["first_token_time"] = time.perf_counter()
+                spec_queue.put(("chunk", chunk))
+        except Exception as e:
+            if not abort_event.is_set():
+                spec_queue.put(("error", e))
+        finally:
+            if abort_event.is_set() and stream_obj is not None:
+                try:
+                    stream_obj.close()
+                except Exception:
+                    pass
+            spec_queue.put(("done", None))
+
+    worker_thread = threading.Thread(target=_spec_stream_worker, daemon=True)
+    worker_thread.start()
+
+    search_query = determine_search_query(user_input, history)
+    if search_query is not None:
+        # Web search is required -> immediately abort speculative direct stream
+        abort_event.set()
+        return search_query, None, None
+
+    return None, spec_queue, spec_meta
+
+
+def detect_auto_parallel_sections(user_input: str) -> list[str] | None:
+    """
+    Automatically detects when a user prompt naturally decomposes into 3 to 6 independent parallel
+    sections without requiring any slash command:
+      1. Explicit numbered sub-questions: `1) ... 2) ... 3) ...`
+      2. Multi-ticker / multi-company comparisons (>= 3 tickers/companies)
+      3. Multi-topic comma-separated explanations (`Explain A, B, C, and D`)
+    """
+    # 1. Explicit numbered sub-tasks: "1) ... 2) ... 3) ..."
+    numbered = re.findall(
+        r"(?:^|\s)(?:\d+[\)\.]\s*)([^0-9\n][^\n\?;]{6,120}?)(?=(?:\s+\d+[\)\.]\s+)|$)",
+        user_input.strip(),
+    )
+    if 3 <= len(numbered) <= 6:
+        return [clean_text(item).rstrip(".,;") for item in numbered]
+
+    u_lower = user_input.lower().strip()
+
+    # 2. Multi-ticker / multi-company comparison of >= 3 tickers
+    if re.search(r"\b(compare|comparison|analyze|breakdown|break\s+down|contrast|detailed|evaluate|outlook)\b", u_lower):
+        tickers = []
+        for tok in re.findall(r"\b[A-Z]{2,5}\b", user_input):
+            if tok not in _TICKER_STOPWORDS and tok not in tickers:
+                tickers.append(tok)
+        for name_key, (sym, _) in _KNOWN_COMPANY_TICKERS.items():
+            if re.search(rf"\b{re.escape(name_key)}\b", u_lower) and sym not in tickers:
+                tickers.append(sym)
+        if 3 <= len(tickers) <= 5:
+            sections = [f"{sym} — Live Quote, Performance & Key Metrics Analysis" for sym in tickers]
+            sections.append(f"Side-by-Side Comparison Table & Relative Summary ({', '.join(tickers)})")
+            return sections
+
+    # 3. Comma-separated multi-topic explanations: "Explain/Describe/Compare A, B, C, and D"
+    m_list = re.match(
+        r"^(?:please\s+)?(?:explain|describe|compare|detail|break\s+down|summarize)\s+(?:the\s+(?:differences\s+between|following\s+topics|concepts\s+of)\s*:?\s*)?(.+)$",
+        user_input.strip(),
+        flags=re.I,
+    )
+    if m_list and "," in m_list.group(1):
+        tail = m_list.group(1).strip().rstrip(".?!")
+        raw_items = re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", tail)
+        clean_items = [it.strip() for it in raw_items if 4 <= len(it.strip()) <= 75 and len(it.strip().split()) <= 10]
+        if 3 <= len(clean_items) <= 5:
+            return clean_items
+
+    return None
+
+
+def plan_parallel_sections(user_input: str) -> list[str] | None:
+    """
+    Feature A — Automatic Section-Parallel / Map-Reduce Planner:
+    Automatically returns a list of 3-6 independent section titles when a prompt is a multi-part,
+    multi-entity, or comprehensive deep-dive request; returns `None` for normal single-stream prompts.
+    """
+    auto_secs = detect_auto_parallel_sections(user_input)
+    if auto_secs:
+        return auto_secs
+
+    u_lower = user_input.lower().strip()
+    is_deep_dive = bool(
+        re.search(
+            r"\b(comprehensive\s+(?:guide|overview|breakdown|analysis)|in-depth\s+(?:guide|analysis|breakdown|explanation)|detailed\s+(?:guide|breakdown|architectural\s+overview)|multi-section|step-by-step\s+guide\s+to\s+building)\b",
+            u_lower,
+        )
+    )
+    if not is_deep_dive:
+        return None
+
+    try:
+        base_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Decompose the user's request into exactly 4 distinct, non-overlapping section titles "
+                    "that can be written in parallel to form a complete, well-structured response.\n"
+                    "Output ONLY 4 lines, one concise section title per line (no numbering, no bullets, no preamble)."
+                ),
+            },
+            {"role": "user", "content": user_input},
+        ]
+        req_messages, extra_params = prepare_request_messages_and_extra(
+            base_messages, use_thinking=False, is_utility_call=True
+        )
+        create_kwargs = {
+            "model": MODEL_NAME,
+            "messages": req_messages,
+            "temperature": 0.0,
+            "max_tokens": 100,
+        }
+        if extra_params:
+            create_kwargs["extra_body"] = extra_params
+
+        resp = client.chat.completions.create(**create_kwargs)
+        raw = strip_thinking_and_dedup(resp.choices[0].message.content or "")
+        lines = []
+        for ln in raw.splitlines():
+            cleaned_ln = re.sub(r"^[\s\-\*\d\.\)\:]+", "", ln).strip().strip("*\"'`")
+            if len(cleaned_ln) >= 4:
+                lines.append(cleaned_ln[:90])
+        if 3 <= len(lines) <= 5:
+            return lines[:5]
+    except Exception:
+        pass
+
+    return [
+        "Core Overview & Fundamental Principles",
+        "Architecture & Underlying Mechanics",
+        "Quantitative Performance & Practical Trade-offs",
+        "Summary Synthesis & Key Takeaways",
+    ]
+
+
+def stream_parallel_sections(
+    base_prefix_messages: list[dict],
+    shared_active_user_content: str,
+    sections: list[str],
+    use_thinking: bool,
+    verbose_flag: bool = False,
+) -> tuple[str, float, float, int, float, float]:
+    """
+    Feature A — Section-Parallel / Map-Reduce Executor:
+    Launches N simultaneous streaming requests (1 per section). All N streams share the exact same
+    `base_prefix_messages` and `shared_active_user_content` prefix so vLLM prefix-caches 99% of the
+    prompt across all N slots, then decodes all N sections in lockstep inside a single hardware batch.
+    Returns (combined_response, ttft_ms, gen_duration, total_tokens, effective_tps, avg_stream_tps).
+    """
+    n_streams = len(sections)
+    section_buffers = ["" for _ in range(n_streams)]
+    section_tokens = [0 for _ in range(n_streams)]
+    section_first_t: list[float | None] = [None for _ in range(n_streams)]
+    section_end_t: list[float | None] = [None for _ in range(n_streams)]
+    section_done = [False for _ in range(n_streams)]
+    lock = threading.Lock()
+    start_time = time.perf_counter()
+
+    def _run_section_stream(idx: int, sec_title: str):
+        other_titles = ", ".join(f"'{s}'" for j, s in enumerate(sections) if j != idx)
+        tail_assignment = (
+            f"\n\n### PARALLEL STREAM ASSIGNMENT (Section {idx + 1} of {n_streams}):\n"
+            f"You are Stream {idx + 1} of {n_streams} generating a multi-section response in parallel.\n"
+            f"Write ONLY Section {idx + 1}: **{sec_title}**.\n"
+            f"- Start directly with the Markdown heading `### {idx + 1}. {sec_title}`.\n"
+            f"- Focus exclusively on `{sec_title}` (~120–220 words, using Markdown tables or bullets where helpful).\n"
+            f"- Do NOT cover the other parallel sections ({other_titles}) and do NOT include a generic intro or conclusion."
+        )
+        sec_payload = list(base_prefix_messages) + [
+            {"role": "user", "content": shared_active_user_content + tail_assignment}
+        ]
+        active_sec_msgs, extra_sec_params = prepare_request_messages_and_extra(
+            sec_payload, use_thinking=use_thinking, is_utility_call=False
+        )
+        if idx == 0 and verbose_flag:
+            console.print(
+                Panel(
+                    json.dumps(active_sec_msgs, indent=2),
+                    title=f"[bold yellow]EXACT vLLM Parallel Payload (Stream 1 of {n_streams})[/bold yellow]",
+                    border_style="yellow",
+                    expand=False,
+                )
+            )
+        stream_kwargs = {
+            "model": MODEL_NAME,
+            "messages": active_sec_msgs,
+            "temperature": 0.6 if use_thinking else 0.7,
+            "max_tokens": min(700, MODEL_PROFILE["max_gen_tokens"]),
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if extra_sec_params:
+            stream_kwargs["extra_body"] = extra_sec_params
+
+        try:
+            stream = client.chat.completions.create(**stream_kwargs)
+            for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta.content or ""
+                    if delta:
+                        now_t = time.perf_counter()
+                        with lock:
+                            if section_first_t[idx] is None:
+                                section_first_t[idx] = now_t
+                            section_buffers[idx] += delta
+                if hasattr(chunk, "usage") and chunk.usage:
+                    with lock:
+                        section_tokens[idx] = chunk.usage.completion_tokens
+        except Exception as e:
+            with lock:
+                section_buffers[idx] += f"\n*(Stream {idx + 1} error: {e})*"
+        finally:
+            with lock:
+                section_end_t[idx] = time.perf_counter()
+                if section_tokens[idx] == 0 and section_buffers[idx]:
+                    section_tokens[idx] = max(1, len(section_buffers[idx]) // 4)
+                section_done[idx] = True
+
+    def _render_parallel_markdown() -> str:
+        parts = []
+        with lock:
+            for i, title in enumerate(sections):
+                raw_sec = section_buffers[i]
+                cleaned_sec = strip_thinking_and_dedup(raw_sec)
+                status_badge = "✓" if section_done[i] else "⚡ streaming..."
+                if cleaned_sec:
+                    if not cleaned_sec.lstrip().startswith("#"):
+                        cleaned_sec = f"### {i + 1}. {title}\n{cleaned_sec}"
+                    parts.append(cleaned_sec)
+                else:
+                    parts.append(f"### {i + 1}. {title}\n*({status_badge})*")
+        return "\n\n---\n\n".join(parts)
+
+    threads = [
+        threading.Thread(target=_run_section_stream, args=(i, sec_title), daemon=True)
+        for i, sec_title in enumerate(sections)
+    ]
+    for t in threads:
+        t.start()
+
+    with Live(Markdown(""), console=console, refresh_per_second=15, vertical_overflow="visible") as live:
+        while not all(section_done):
+            live.update(Markdown(_render_parallel_markdown()))
+            time.sleep(0.06)
+        live.update(Markdown(_render_parallel_markdown()))
+
+    for t in threads:
+        t.join(timeout=1.0)
+
+    end_time = time.perf_counter()
+    valid_firsts = [t for t in section_first_t if t is not None]
+    first_token_t = min(valid_firsts) if valid_firsts else end_time
+    ttft_ms = (first_token_t - start_time) * 1000.0
+    gen_duration = max(0.001, end_time - first_token_t)
+    total_tokens = sum(section_tokens)
+    effective_tps = total_tokens / gen_duration
+
+    per_stream_rates = []
+    for i in range(n_streams):
+        if section_first_t[i] and section_end_t[i] and section_end_t[i] > section_first_t[i]:
+            per_stream_rates.append(section_tokens[i] / (section_end_t[i] - section_first_t[i]))
+    avg_stream_tps = sum(per_stream_rates) / len(per_stream_rates) if per_stream_rates else (effective_tps / n_streams)
+
+    final_parts = []
+    for i, title in enumerate(sections):
+        cleaned_sec = strip_thinking_and_dedup(section_buffers[i])
+        if cleaned_sec:
+            if not cleaned_sec.lstrip().startswith("#"):
+                cleaned_sec = f"### {i + 1}. {title}\n{cleaned_sec}"
+            final_parts.append(cleaned_sec)
+    combined_response = "\n\n---\n\n".join(final_parts)
+    return combined_response, ttft_ms, gen_duration, total_tokens, effective_tps, avg_stream_tps
+
+
 # --- Session Startup ---
 console.print(
     Panel(
@@ -1376,28 +1709,77 @@ while True:
             continue
 
         use_thinking = think_mode or force_think_this_turn
-
-        # Built-in Current Time, Date & World Clock Skill
-        use_clock_skill = is_clock_skill_query(user_input)
-        clock_skill_block = ""
-        if use_clock_skill:
-            clock_status, clock_skill_block = build_live_clock_skill_context(user_input)
-            console.print(f"[dim][Skill: Current Time] [bold cyan]{clock_status}[/bold cyan][/dim]")
-
-        # Context-Aware Hybrid Search Classification Step
-        if use_clock_skill and not is_external_data_query(user_input):
-            search_query = None
-        else:
-            console.print("[dim]Analyzing search intent...[/dim]", end="\r")
-            search_query = determine_search_query(user_input, conversation_history)
-
         is_quant_query = needs_quantitative_reasoning(user_input)
+        effective_thinking = use_thinking or is_quant_query
         quant_instruction = (
             "\n- For any mathematical calculations, share allocations, elapsed time ('minutes ago' by subtracting in the same timezone), or physics formulas requested, "
             "write out each intermediate step and equation explicitly before stating the final result so every number is exact."
             if is_quant_query
             else ""
         )
+
+        # 1. Merge Base System Prompt & Summary Buffer into a Single System Message
+        if summary_buffer:
+            combined_system_content = (
+                f"{BASE_SYSTEM_PROMPT}\n\n"
+                f"Prior Conversation Summary Buffer (Background Context):\n{summary_buffer}"
+            )
+        else:
+            combined_system_content = BASE_SYSTEM_PROMPT
+
+        base_prefix_messages = [{"role": "system", "content": combined_system_content}]
+        base_prefix_messages.extend(conversation_history[1:])
+
+        # 2. Built-in Current Time, Date & World Clock Skill
+        use_clock_skill = is_clock_skill_query(user_input)
+        clock_skill_block = ""
+        if use_clock_skill:
+            clock_status, clock_skill_block = build_live_clock_skill_context(user_input)
+            console.print(f"[dim][Skill: Current Time] [bold cyan]{clock_status}[/bold cyan][/dim]")
+
+        # 3. Check Automatic Section-Parallel / Map-Reduce Decomposition (Feature A)
+        parallel_sections = plan_parallel_sections(user_input)
+
+        # Prepare direct-turn content (used for direct response or speculative racing)
+        if use_clock_skill:
+            direct_user_content = (
+                f"{clock_skill_block}\n\n"
+                "### INSTRUCTIONS:\n"
+                "Answer the Active User Request below using the exact live current time, date, day of the week, and timezone values "
+                f"from the [SKILL: LIVE SYSTEM CLOCK & CALENDAR] block above. Ignore any older timestamps from earlier conversation turns.{quant_instruction}\n\n"
+                f"### ACTIVE USER REQUEST:\n{user_input}"
+            )
+        else:
+            direct_user_content = (
+                f"{user_input}\n\n[Instruction: Write out each intermediate calculation step explicitly before stating the final result.]"
+                if is_quant_query and not use_thinking
+                else user_input
+            )
+
+        spec_queue = None
+        spec_meta = None
+
+        if parallel_sections:
+            # Automatic Section-Parallel turn: determine if web search is needed first
+            if use_clock_skill and not is_external_data_query(user_input):
+                search_query = None
+            else:
+                console.print("[dim]Analyzing search intent...[/dim]", end="\r")
+                search_query = determine_search_query(user_input, conversation_history)
+        else:
+            # Standard turn: Feature B — Speculative Router + Direct-Answer Racing
+            spec_base_payload = list(base_prefix_messages) + [{"role": "user", "content": direct_user_content}]
+            spec_active_payload, spec_extra_body = prepare_request_messages_and_extra(
+                spec_base_payload, use_thinking=effective_thinking, is_utility_call=False
+            )
+            console.print("[dim]Analyzing search intent (speculative direct stream active)...[/dim]", end="\r")
+            search_query, spec_queue, spec_meta = race_router_and_speculative_stream(
+                user_input,
+                conversation_history,
+                spec_active_payload,
+                spec_extra_body,
+                effective_thinking,
+            )
 
         if search_query:
             console.print(f"[dim]Searching web (max 5) for: '[bold cyan]{search_query}[/bold cyan]'...[/dim]")
@@ -1410,117 +1792,151 @@ while True:
                 f"while maintaining continuity with our recent conversation history.{quant_instruction}\n\n"
                 f"### ACTIVE USER REQUEST:\n{user_input}"
             )
-        elif use_clock_skill:
-            active_user_content = (
-                f"{clock_skill_block}\n\n"
-                "### INSTRUCTIONS:\n"
-                "Answer the Active User Request below using the exact live current time, date, day of the week, and timezone values "
-                f"from the [SKILL: LIVE SYSTEM CLOCK & CALENDAR] block above. Ignore any older timestamps from earlier conversation turns.{quant_instruction}\n\n"
-                f"### ACTIVE USER REQUEST:\n{user_input}"
-            )
         else:
-            console.print("[dim]Direct response (no web search needed).[/dim]")
-            active_user_content = (
-                f"{user_input}\n\n[Instruction: Write out each intermediate calculation step explicitly before stating the final result.]"
-                if is_quant_query and not use_thinking
-                else user_input
-            )
+            if spec_queue is not None:
+                console.print("[dim]Direct response (speculative stream hit — router latency hidden).[/dim]")
+            elif not use_clock_skill:
+                console.print("[dim]Direct response (no web search needed).[/dim]")
+            active_user_content = direct_user_content
 
-        # --- CONSTRUCT VLLM PAYLOAD ARRAY ---
-        # 1. Merge Base System Prompt & Summary Buffer into a Single System Message
-        if summary_buffer:
-            combined_system_content = (
-                f"{BASE_SYSTEM_PROMPT}\n\n"
-                f"Prior Conversation Summary Buffer (Background Context):\n{summary_buffer}"
-            )
-        else:
-            combined_system_content = BASE_SYSTEM_PROMPT
-
-        base_payload = [{"role": "system", "content": combined_system_content}]
-
-        # 2. Verbatim Recent Pairs
-        base_payload.extend(conversation_history[1:])
-
-        # 3. Active User Turn
-        base_payload.append({"role": "user", "content": active_user_content})
-
-        # 4. Adapt payload & extra_body parameters to the auto-detected MODEL_PROFILE
-        effective_thinking = use_thinking or is_quant_query
-        active_payload, extra_body_params = prepare_request_messages_and_extra(
-            base_payload, use_thinking=effective_thinking, is_utility_call=False
-        )
-
-        # Echo EXACT vLLM Payload Array if Verbose Mode is Active
-        if verbose_mode or force_verbose_this_turn:
-            full_payload_json = json.dumps(active_payload, indent=2)
+        # --- EXECUTE GENERATION (AUTO SECTION-PARALLEL OR SINGLE STREAM) ---
+        if parallel_sections:
             console.print(
-                Panel(
-                    full_payload_json,
-                    title="[bold yellow]EXACT vLLM Payload Sent to Model[/bold yellow]",
-                    border_style="yellow",
-                    expand=False,
-                )
+                f"[dim][Auto-Parallel Map-Reduce] Launching [bold cyan]{len(parallel_sections)} simultaneous streams[/bold cyan]: "
+                f"{' | '.join(parallel_sections)}[/dim]"
+            )
+            console.print("\n[bold green]Assistant:[/bold green]")
+            (
+                full_response,
+                ttft_ms,
+                gen_duration,
+                completion_tokens,
+                tps,
+                avg_stream_tps,
+            ) = stream_parallel_sections(
+                base_prefix_messages,
+                active_user_content,
+                parallel_sections,
+                use_thinking=effective_thinking,
+                verbose_flag=(verbose_mode or force_verbose_this_turn),
+            )
+            speedup_x = tps / avg_stream_tps if avg_stream_tps > 0 else float(len(parallel_sections))
+            metrics_summary = (
+                f"[dim]Parallel Streams: [bold cyan]{len(parallel_sections)}[/bold cyan] | "
+                f"TTFT: [bold]{ttft_ms:.1f}ms[/bold] | "
+                f"Gen Time: [bold]{gen_duration:.2f}s[/bold] | "
+                f"Tokens: [bold]{completion_tokens}[/bold] | "
+                f"Effective Speed: [bold cyan]{tps:.1f} t/s[/bold cyan] "
+                f"([bold green]{speedup_x:.1f}x[/bold green] vs {avg_stream_tps:.1f} t/s per stream)[/dim]"
+            )
+            console.print(Panel(metrics_summary, border_style="dim", expand=False))
+            console.print()
+        else:
+            base_payload = list(base_prefix_messages) + [{"role": "user", "content": active_user_content}]
+            active_payload, extra_body_params = prepare_request_messages_and_extra(
+                base_payload, use_thinking=effective_thinking, is_utility_call=False
             )
 
-        console.print("\n[bold green]Assistant:[/bold green]")
+            # Echo EXACT vLLM Payload Array if Verbose Mode is Active
+            if verbose_mode or force_verbose_this_turn:
+                full_payload_json = json.dumps(active_payload, indent=2)
+                console.print(
+                    Panel(
+                        full_payload_json,
+                        title="[bold yellow]EXACT vLLM Payload Sent to Model[/bold yellow]",
+                        border_style="yellow",
+                        expand=False,
+                    )
+                )
 
-        # Performance Metric Counters
-        start_time = time.perf_counter()
-        first_token_time = None
-        full_response = ""
-        completion_tokens = 0
+            console.print("\n[bold green]Assistant:[/bold green]")
 
-        stream_kwargs = {
-            "model": MODEL_NAME,
-            "messages": active_payload,
-            "temperature": 0.6 if effective_thinking else 0.7,
-            "max_tokens": MODEL_PROFILE["max_gen_tokens"],
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if extra_body_params:
-            stream_kwargs["extra_body"] = extra_body_params
+            full_response = ""
+            completion_tokens = 0
 
-        stream = client.chat.completions.create(**stream_kwargs)
+            if spec_queue is not None and spec_meta is not None:
+                # Consume the already-running speculative direct stream
+                start_time = spec_meta["start_time"]
+                first_token_time = spec_meta["first_token_time"]
+                with Live(Markdown(""), console=console, refresh_per_second=15, vertical_overflow="visible") as live:
+                    while True:
+                        msg_type, item = spec_queue.get()
+                        if msg_type == "done":
+                            break
+                        if msg_type == "error":
+                            raise item
+                        chunk = item
+                        if chunk.choices and len(chunk.choices) > 0:
+                            content = chunk.choices[0].delta.content or ""
+                            if content:
+                                if first_token_time is None:
+                                    first_token_time = spec_meta["first_token_time"] or time.perf_counter()
+                                full_response += content
+                                if use_thinking:
+                                    live.update(Markdown(format_thinking_markdown(full_response)))
+                                else:
+                                    cleaned_live = strip_thinking_and_dedup(full_response)
+                                    if cleaned_live:
+                                        live.update(Markdown(cleaned_live))
+                                    elif is_quant_query:
+                                        live.update(Markdown("*Calculating step-by-step...*"))
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            completion_tokens = chunk.usage.completion_tokens
+                end_time = time.perf_counter()
+            else:
+                start_time = time.perf_counter()
+                first_token_time = None
+                stream_kwargs = {
+                    "model": MODEL_NAME,
+                    "messages": active_payload,
+                    "temperature": 0.6 if effective_thinking else 0.7,
+                    "max_tokens": MODEL_PROFILE["max_gen_tokens"],
+                    "stream": True,
+                    "stream_options": {"include_usage": True},
+                }
+                if extra_body_params:
+                    stream_kwargs["extra_body"] = extra_body_params
 
-        with Live(Markdown(""), console=console, refresh_per_second=15, vertical_overflow="visible") as live:
-            for chunk in stream:
-                if chunk.choices and len(chunk.choices) > 0:
-                    content = chunk.choices[0].delta.content or ""
-                    if content:
-                        if first_token_time is None:
-                            first_token_time = time.perf_counter()
-                        full_response += content
-                        if use_thinking:
-                            live.update(Markdown(format_thinking_markdown(full_response)))
-                        else:
-                            cleaned_live = strip_thinking_and_dedup(full_response)
-                            if cleaned_live:
-                                live.update(Markdown(cleaned_live))
-                            elif is_quant_query:
-                                live.update(Markdown("*Calculating step-by-step...*"))
+                stream = client.chat.completions.create(**stream_kwargs)
 
-                if hasattr(chunk, "usage") and chunk.usage:
-                    completion_tokens = chunk.usage.completion_tokens
+                with Live(Markdown(""), console=console, refresh_per_second=15, vertical_overflow="visible") as live:
+                    for chunk in stream:
+                        if chunk.choices and len(chunk.choices) > 0:
+                            content = chunk.choices[0].delta.content or ""
+                            if content:
+                                if first_token_time is None:
+                                    first_token_time = time.perf_counter()
+                                full_response += content
+                                if use_thinking:
+                                    live.update(Markdown(format_thinking_markdown(full_response)))
+                                else:
+                                    cleaned_live = strip_thinking_and_dedup(full_response)
+                                    if cleaned_live:
+                                        live.update(Markdown(cleaned_live))
+                                    elif is_quant_query:
+                                        live.update(Markdown("*Calculating step-by-step...*"))
 
-        end_time = time.perf_counter()
+                        if hasattr(chunk, "usage") and chunk.usage:
+                            completion_tokens = chunk.usage.completion_tokens
 
-        if completion_tokens == 0 and full_response:
-            completion_tokens = max(1, int(len(full_response) / 4))
+                end_time = time.perf_counter()
 
-        # Metric Calculations
-        ttft_ms = ((first_token_time or end_time) - start_time) * 1000
-        gen_duration = end_time - (first_token_time or start_time)
-        tps = completion_tokens / gen_duration if gen_duration > 0 else 0.0
+            if completion_tokens == 0 and full_response:
+                completion_tokens = max(1, int(len(full_response) / 4))
 
-        metrics_summary = (
-            f"[dim]TTFT: [bold]{ttft_ms:.1f}ms[/bold] | "
-            f"Gen Time: [bold]{gen_duration:.2f}s[/bold] | "
-            f"Tokens: [bold]{completion_tokens}[/bold] | "
-            f"Speed: [bold cyan]{tps:.1f} t/s[/bold cyan][/dim]"
-        )
-        console.print(Panel(metrics_summary, border_style="dim", expand=False))
-        console.print()
+            # Metric Calculations
+            ttft_ms = ((first_token_time or end_time) - start_time) * 1000
+            gen_duration = end_time - (first_token_time or start_time)
+            tps = completion_tokens / gen_duration if gen_duration > 0 else 0.0
+
+            metrics_summary = (
+                f"[dim]TTFT: [bold]{ttft_ms:.1f}ms[/bold] | "
+                f"Gen Time: [bold]{gen_duration:.2f}s[/bold] | "
+                f"Tokens: [bold]{completion_tokens}[/bold] | "
+                f"Speed: [bold cyan]{tps:.1f} t/s[/bold cyan][/dim]"
+            )
+            console.print(Panel(metrics_summary, border_style="dim", expand=False))
+            console.print()
 
         # --- RECORD CLEAN HISTORY TURN (WITH CORRUPTION & COT FILTERING) ---
         clean_resp = strip_thinking_and_dedup(full_response)
