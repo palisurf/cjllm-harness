@@ -10,20 +10,25 @@ extraction, rolling summary-buffer memory compression, and live TTFT/TPS telemet
 """
 
 import argparse
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import html
 import json
 import os
+import queue
 import re
 import readline
+import threading
 import time
 import warnings
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 from openai import OpenAI
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.text import Text
 
 # Suppress deprecation warnings from legacy package imports
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
@@ -67,8 +72,20 @@ parser.add_argument(
 parser.add_argument(
     "--max-pairs",
     type=int,
-    default=10,
-    help="Number of verbatim user/assistant turn pairs to retain before rolling compression (default: 10)",
+    default=30,
+    help="High-water mark of verbatim user/assistant turn pairs before batch compression (default: 30)",
+)
+parser.add_argument(
+    "--max-verbatim-tokens",
+    type=int,
+    default=20000,
+    help="High-water mark of approximate verbatim history tokens before batch compression (default: 20000)",
+)
+parser.add_argument(
+    "--evict-batch",
+    type=int,
+    default=8,
+    help="Number of oldest turn pairs to fold in a single batch when high-water mark is reached (default: 8)",
 )
 parser.add_argument(
     "--cache",
@@ -78,9 +95,42 @@ parser.add_argument(
 parser.add_argument(
     "--think",
     action="store_true",
-    help="Start session with Chain-of-Thought reasoning mode enabled",
+    help="Start session with Chain-of-Thought reasoning enabled",
+)
+parser.add_argument(
+    "--tz",
+    default=os.environ.get("CJLLM_TZ", None),
+    help="IANA timezone override for local clock (default: OS local timezone, or America/Los_Angeles if OS is Etc/UTC)",
 )
 args, _ = parser.parse_known_args()
+
+
+def resolve_local_timezone(tz_override: str | None = None):
+    """
+    Resolves the user's local timezone. Many headless Linux servers and Docker containers
+    default their OS clock to `Etc/UTC`, which shifts the calendar date forward by 1 day
+    every evening after 5:00 PM Pacific Time. When the OS timezone is generic UTC/GMT and no
+    explicit override is given, defaults to `America/Los_Angeles` (Pacific Time).
+    """
+    if tz_override:
+        try:
+            return ZoneInfo(tz_override)
+        except Exception:
+            pass
+    try:
+        sys_now = datetime.now().astimezone()
+        tz_name = (sys_now.tzname() or "").upper()
+        if tz_name not in ("UTC", "ETC/UTC", "GMT", "UCT", ""):
+            return sys_now.tzinfo
+    except Exception:
+        pass
+    try:
+        return ZoneInfo("America/Los_Angeles")
+    except Exception:
+        return timezone(timedelta(hours=-7), name="PDT")
+
+
+LOCAL_TZ = resolve_local_timezone(args.tz)
 
 # Initialize OpenAI client pointing to local inference engine
 client = OpenAI(
@@ -91,6 +141,8 @@ client = OpenAI(
 DEFAULT_CACHE_FILE = args.cache
 COMMAND_HISTORY_FILE = ".chat_prompt_history"
 MAX_PAIRS = args.max_pairs
+MAX_VERBATIM_TOKENS = args.max_verbatim_tokens
+EVICT_BATCH_PAIRS = max(1, min(args.evict_batch, max(1, MAX_PAIRS // 2)))
 
 # --- DEEPSEEK-R1-DISTILL / QWEN3 TOKENIZER BRIDGE CONSTANTS ---
 # When a container serves DeepSeek-R1-Distill-Qwen-32B weights under the Qwen/Qwen3-32B tokenizer:
@@ -469,12 +521,70 @@ def _extract_yahoo_stock_card(html_text: str, label: str = "") -> list[str]:
     return out
 
 
+def _extract_yahoo_weather_card(html_text: str, label: str = "") -> list[str]:
+    """Helper to parse Yahoo Search compWeatherInfo / weatherCarousel blocks from raw HTML."""
+    weather_parts = []
+    prefix = f"[Live Weather & Multi-Day Forecast Card — {label}]" if label else "[Live Weather & Multi-Day Forecast Card]"
+    for m in re.finditer(r'class="[^"]*compWeatherInfo[^"]*"', html_text):
+        idx = m.start()
+        chunk = html_text[idx : idx + 35000]
+        chunk = re.sub(r"data-forecast='[^']*'", "", chunk)
+        chunk = re.sub(r'data-forecast="[^"]*"', "", chunk)
+        chunk = re.sub(r"data-yga='[^']*'", "", chunk)
+        chunk = re.sub(r"<svg[^>]*>.*?<title[^>]*>(.*?)</title>.*?</svg>", r" (\1) ", chunk, flags=re.S)
+        chunk = re.sub(r"<svg[^>]*>.*?</svg>", " ", chunk, flags=re.S)
+        chunk = re.sub(r"<style[^>]*>.*?</style>", " ", chunk, flags=re.S)
+        chunk = re.sub(r"<script[^>]*>.*?</script>", " ", chunk, flags=re.S)
+        chunk = re.sub(r"^[^<]*>", " ", chunk)
+        chunk = re.sub(r"<[^>]*$", " ", chunk)
+        w_txt = clean_text(re.sub(r"<[^>]+>", " ", chunk))
+        for stop_marker in ["Temperature Precipitation Wind", "People also search", "Explore AI results"]:
+            if stop_marker in w_txt:
+                w_txt = w_txt.split(stop_marker)[0].strip()
+        if len(w_txt) > 20:
+            weather_parts.append(w_txt[:500])
+    if weather_parts:
+        return [f"{prefix} " + " | Forecast: ".join(weather_parts[:2])]
+    return []
+
+
+_TICKER_STOPWORDS = {
+    "THE", "AND", "FOR", "WITH", "FROM", "THAT", "THIS", "WHAT", "WHEN", "WHERE", "WHICH",
+    "HOW", "WHY", "WHO", "ARE", "WAS", "WERE", "TODAY", "NOW", "LIVE", "DATA", "PRICE",
+    "STOCK", "QUOTE", "INDEX", "MARKET", "CAP", "PE", "EPS", "ETF", "IPO", "CEO", "CFO",
+    "GDP", "CPI", "FED", "SEC", "NYSE", "NASDAQ", "DOW", "DJIA", "SP", "USD", "USA", "US",
+    "UK", "EU", "NOAA", "NDBC", "UTC", "GMT", "PDT", "PST", "EDT", "EST", "CDT", "CST",
+    "VS", "OR", "IN", "ON", "AT", "TO", "OF", "BY", "ALL", "TOP", "NEW", "HIGH", "LOW",
+    "CA", "HI", "NY", "TX", "FL", "WA", "OR", "AZ", "NV", "CO", "MA", "IL", "PA", "OH",
+}
+
+_KNOWN_COMPANY_TICKERS = {
+    "nvidia": ("NVDA", "NVDA stock quote"),
+    "apple": ("AAPL", "AAPL stock quote"),
+    "microsoft": ("MSFT", "MSFT stock quote"),
+    "amd": ("AMD", "AMD stock quote"),
+    "broadcom": ("AVGO", "AVGO stock quote"),
+    "alphabet": ("GOOGL", "GOOGL stock quote"),
+    "google": ("GOOGL", "GOOGL stock quote"),
+    "amazon": ("AMZN", "AMZN stock quote"),
+    "meta": ("META", "META stock quote"),
+    "tesla": ("TSLA", "TSLA stock quote"),
+    "intel": ("INTC", "INTC stock quote"),
+    "tsmc": ("TSM", "TSM stock quote"),
+    "micron": ("MU", "MU stock quote"),
+    "palantir": ("PLTR", "PLTR stock quote"),
+    "generac": ("GNRC", "GNRC stock quote"),
+}
+
+
 def fetch_yahoo_rich_cards(query: str) -> list[str]:
     """
-    Extracts rich top-of-page Yahoo Search cards (such as live stock/market quotes
-    and structured fact tables) that DDGS().text() skips when parsing organic links.
-    Automatically expands multi-index queries (Dow, S&P 500, Nasdaq) so all requested
-    indices receive live quote cards.
+    Extracts rich top-of-page Yahoo Search cards (live stock/index/crypto/commodity quotes,
+    multi-city weather forecasts, and structured fact tables) that DDGS().text() skips.
+    Automatically expands:
+      - Multi-index / macro queries (Dow, S&P 500, Nasdaq, Russell 2000, Bitcoin, Gold, 10Y Treasury)
+      - Multi-ticker stock comparisons (e.g., 'NVDA AAPL AMD stock price today')
+      - Multi-location weather comparisons (e.g., 'weather Malibu CA vs Honolulu HI')
     """
     cards = []
     if primp is None:
@@ -484,17 +594,50 @@ def fetch_yahoo_rich_cards(query: str) -> list[str]:
         http_client = primp.Client(impersonate="random", timeout=5)
         q_lower = query.lower()
 
-        # Check if query asks for multiple major US stock indices at once
-        index_targets = []
-        if re.search(r"\b(dow|djia|dji)\b", q_lower):
-            index_targets.append(("Dow Jones Industrial Average", "Dow Jones Industrial Average quote"))
-        if re.search(r"\b(s&p|sp\s*500|s\s*p\s*500|\bsp\b)\b", q_lower):
-            index_targets.append(("S&P 500", "S&P 500 index quote"))
-        if re.search(r"\b(nasdaq|ixic)\b", q_lower):
-            index_targets.append(("Nasdaq Composite", "Nasdaq Composite quote"))
+        # 1. Check for multi-index, macro-asset, or multi-ticker financial queries
+        finance_targets: list[tuple[str, str]] = []
+        seen_labels: set[str] = set()
 
-        if len(index_targets) >= 2:
-            for idx_label, idx_query in index_targets:
+        def _add_fin_target(lbl: str, q_str: str):
+            if lbl not in seen_labels:
+                seen_labels.add(lbl)
+                finance_targets.append((lbl, q_str))
+
+        if re.search(r"\b(dow|djia|dji)\b", q_lower):
+            _add_fin_target("Dow Jones (^DJI)", "Dow Jones Industrial Average quote")
+        if re.search(r"\b(s&p|sp\s*500|s\s*p\s*500|\bsp\b|gspc)\b", q_lower):
+            _add_fin_target("S&P 500 (^GSPC)", "S&P 500 index quote")
+        if re.search(r"\b(nasdaq|ixic)\b", q_lower):
+            _add_fin_target("Nasdaq Composite (^IXIC)", "Nasdaq Composite quote")
+        if re.search(r"\b(russell\s*2000|rut)\b", q_lower):
+            _add_fin_target("Russell 2000 (^RUT)", "Russell 2000 index quote")
+        if re.search(r"\b(bitcoin|btc)\b", q_lower):
+            _add_fin_target("Bitcoin (BTC-USD)", "BTC-USD price quote")
+        if re.search(r"\b(ethereum|eth)\b", q_lower):
+            _add_fin_target("Ethereum (ETH-USD)", "ETH-USD price quote")
+        if re.search(r"\b(gold\s+price|gold\s+futures|\bgold\b)\b", q_lower) and any(
+            k in q_lower for k in ("price", "quote", "move", "today", "market", "bitcoin", "treasury", "yield", "oil", "silver")
+        ):
+            _add_fin_target("Gold (GC=F)", "Gold futures GC=F quote")
+        if re.search(r"\b(10[-\s]*year\s+treasury|10y\s+yield|treasury\s+yield|tnx)\b", q_lower):
+            _add_fin_target("10-Year Treasury Yield (^TNX)", "^TNX 10 year treasury yield quote")
+
+        # Detect explicit uppercase stock tickers (e.g., NVDA, AAPL, AMD) or known company names
+        has_fin_context = any(
+            w in q_lower
+            for w in ("stock", "price", "quote", "share", "market", "cap", "pe", "ticker", "compare", "today", "earnings", "close")
+        )
+        for comp_name, (tk, tk_q) in _KNOWN_COMPANY_TICKERS.items():
+            if re.search(rf"\b{comp_name}\b", q_lower):
+                _add_fin_target(tk, tk_q)
+
+        if has_fin_context:
+            for tk in re.findall(r"\b([A-Z]{2,5})\b", query):
+                if tk not in _TICKER_STOPWORDS:
+                    _add_fin_target(tk, f"{tk} stock quote")
+
+        if len(finance_targets) >= 2:
+            for idx_label, idx_query in finance_targets[:5]:
                 try:
                     r_idx = http_client.get(f"https://search.yahoo.com/search?p={quote_plus(idx_query)}")
                     if r_idx.status_code == 200 and r_idx.text:
@@ -502,38 +645,46 @@ def fetch_yahoo_rich_cards(query: str) -> list[str]:
                 except Exception:
                     pass
 
+        # 2. Check for multi-location weather comparison queries (e.g. "weather Malibu CA vs Honolulu HI")
+        weather_cards: list[str] = []
+        if any(w in q_lower for w in ("weather", "forecast", "temperature")):
+            loc_cleaned = re.sub(
+                r"\b(compare|current|weather|forecast|temperature|in|for|between|today|right now|3-day|5-day|7-day|what|is|the)\b",
+                " ",
+                query,
+                flags=re.I,
+            )
+            loc_parts = [
+                p.strip(" ,.;:?!-")
+                or ""
+                for p in re.split(r"\b(?:vs\.?|versus|and|compared\s+to|or)\b|;", loc_cleaned, flags=re.I)
+            ]
+            loc_parts = [re.sub(r"\s+", " ", p).strip() for p in loc_parts if len(p.strip()) >= 3]
+            if len(loc_parts) >= 2:
+                for loc in loc_parts[:3]:
+                    try:
+                        r_w = http_client.get(f"https://search.yahoo.com/search?p={quote_plus('weather ' + loc)}")
+                        if r_w.status_code == 200 and r_w.text:
+                            weather_cards.extend(_extract_yahoo_weather_card(r_w.text, label=loc))
+                    except Exception:
+                        pass
+
         url = f"https://search.yahoo.com/search?p={quote_plus(query)}"
         resp = http_client.get(url)
         if resp.status_code != 200 or not resp.text:
+            cards.extend(weather_cards)
             return cards
         html_text = resp.text
 
-        # 1. Live Finance / Market Quote Card (if not already populated by multi-index expansion)
+        # Single-target fallback for Finance Quote Card
         if not cards:
             cards.extend(_extract_yahoo_stock_card(html_text))
 
-        # 2. Live Weather & 7/10-Day Forecast Card (compWeatherInfo / weatherCarousel dailies)
-        weather_parts = []
-        for m in re.finditer(r'class="[^"]*compWeatherInfo[^"]*"', html_text):
-            idx = m.start()
-            chunk = html_text[idx : idx + 35000]
-            chunk = re.sub(r"data-forecast='[^']*'", "", chunk)
-            chunk = re.sub(r'data-forecast="[^"]*"', "", chunk)
-            chunk = re.sub(r"data-yga='[^']*'", "", chunk)
-            chunk = re.sub(r"<svg[^>]*>.*?<title[^>]*>(.*?)</title>.*?</svg>", r" (\1) ", chunk, flags=re.S)
-            chunk = re.sub(r"<svg[^>]*>.*?</svg>", " ", chunk, flags=re.S)
-            chunk = re.sub(r"<style[^>]*>.*?</style>", " ", chunk, flags=re.S)
-            chunk = re.sub(r"<script[^>]*>.*?</script>", " ", chunk, flags=re.S)
-            chunk = re.sub(r"^[^<]*>", " ", chunk)
-            chunk = re.sub(r"<[^>]*$", " ", chunk)
-            w_txt = clean_text(re.sub(r"<[^>]+>", " ", chunk))
-            for stop_marker in ["Temperature Precipitation Wind", "People also search", "Explore AI results"]:
-                if stop_marker in w_txt:
-                    w_txt = w_txt.split(stop_marker)[0].strip()
-            if len(w_txt) > 20:
-                weather_parts.append(w_txt[:500])
-        if weather_parts:
-            cards.append("[Live Weather & Multi-Day Forecast Card] " + " | Forecast: ".join(weather_parts[:2]))
+        # Single-target fallback for Weather Card
+        if weather_cards:
+            cards.extend(weather_cards)
+        else:
+            cards.extend(_extract_yahoo_weather_card(html_text))
 
         # 3. Structured Result Fact Tables (grp-talgo-facts)
         fact_blocks = []
@@ -549,14 +700,16 @@ def fetch_yahoo_rich_cards(query: str) -> list[str]:
     return cards
 
 
-def fetch_top_page_table_or_excerpt(text_results: list[dict], max_chars: int = 2800) -> str:
+def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", max_chars: int = 4500) -> str:
     """
-    Fetches the highest-priority organic result URLs using `primp` and extracts structured
-    HTML `<table>` rows across up to 6 tables per page (including NOAA NDBC buoy tables,
-    surf/swell/tide forecasts, and market rankings) so queries asking for tables or detailed
-    figures get actual page data rather than just a 1-sentence meta description.
+    Two-pass structured webpage extractor using `primp`:
+      - Pass 1 (Tabular Priority): Scans up to 4 candidate URLs (including auto-resolved
+        5-digit NOAA NDBC buoy station pages) for structured HTML `<table>` data across
+        up to 6 tables per page so a non-tabular rank-1 article never shadows a real table at rank 2-4.
+      - Pass 2 (Plain-Text Excerpt Fallback): If no candidate URL contains a valid HTML `<table>`,
+        extracts a cleaned article excerpt from the top reachable candidate.
     """
-    if primp is None or not text_results:
+    if primp is None or (not text_results and not query):
         return ""
 
     preferred_domains = (
@@ -579,47 +732,56 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], max_chars: int = 2
     )
     candidate_urls = []
 
-    # Automatically resolve NOAA NDBC 5-digit buoy station IDs mentioned in results (e.g., 46221)
-    for res in text_results:
-        combined_meta = f"{res.get('title', '')} {res.get('href', '')} {res.get('body', '')}"
-        if any(k in combined_meta.lower() for k in ("buoy", "ndbc", "noaa", "swell")):
-            for station_match in re.findall(r"\b(46\d{3}|41\d{3}|42\d{3}|44\d{3}|51\d{3})\b", combined_meta):
-                ndbc_url = f"https://www.ndbc.noaa.gov/station_page.php?station={station_match}"
-                if ndbc_url not in candidate_urls:
-                    candidate_urls.append(ndbc_url)
+    # Automatically resolve NOAA NDBC 5-digit buoy station IDs from query or search results (e.g., 46221, 46054)
+    all_meta_sources = [query] + [
+        f"{res.get('title', '')} {res.get('href', '')} {res.get('body', '')}" for res in (text_results or [])
+    ]
+    combined_all = " ".join(all_meta_sources)
+    if any(k in combined_all.lower() for k in ("buoy", "ndbc", "noaa", "swell", "station", "wave")):
+        for station_match in re.findall(r"\b(46\d{3}|41\d{3}|42\d{3}|44\d{3}|51\d{3})\b", combined_all):
+            ndbc_url = f"https://www.ndbc.noaa.gov/station_page.php?station={station_match}"
+            if ndbc_url not in candidate_urls:
+                candidate_urls.append(ndbc_url)
 
-    for res in text_results:
+    for res in text_results or []:
         href = res.get("href", "")
         if href and any(d in href for d in preferred_domains) and href not in candidate_urls:
             candidate_urls.append(href)
-    for res in text_results:
+    for res in text_results or []:
         href = res.get("href", "")
         if href and href not in candidate_urls:
             candidate_urls.append(href)
 
     http_client = primp.Client(impersonate="random", timeout=5)
     extracted_blocks = []
-    for url in candidate_urls[:3]:
+    fallback_excerpt = ""
+
+    for url in candidate_urls[:4]:
         try:
             resp = http_client.get(url)
             if resp.status_code != 200 or not resp.text:
                 continue
             raw = resp.text
-            for tag in ("script", "style", "svg", "noscript", "header", "footer", "nav"):
+            for tag in ("script", "style", "svg", "noscript", "header", "footer", "nav", "sup"):
                 raw = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", " ", raw, flags=re.S | re.I)
+            # Strip MediaWiki data-mw JSON attributes (which can contain '>' characters that break tag stripping)
+            raw = re.sub(r"\sdata-mw='[^']*'", "", raw)
+            raw = re.sub(r'\sdata-mw="[^"]*"', "", raw)
 
-            # Extract structured HTML <table> rows across up to 6 tables per page
-            tables = re.findall(r"<table[^>]*>(.*?)</table>", raw, flags=re.S | re.I)
+            # Pass 1: Extract structured HTML <table> rows across up to 6 tables per page
+            tables = re.findall(r"<table([^>]*)>(.*?)</table>", raw, flags=re.S | re.I)
             if tables:
                 rows_out = []
-                for tbl in tables[:6]:
-                    tbl_rows = 0
+                for tbl_attrs, tbl in tables[:8]:
+                    if re.search(r"\b(navbox|ambox|mbox|metadata|sistersitebox|toc)\b", tbl_attrs, flags=re.I):
+                        continue
+                    tbl_rows_list = []
                     for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, flags=re.S | re.I):
                         cells = [
                             clean_text(re.sub(r"<[^>]+>", " ", cell))
                             for cell in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)
                         ]
-                        cells = [c for c in cells if c]
+                        cells = [c for c in cells if c and not c.startswith("#") and "DCDCDC" not in c]
                         if len(cells) >= 2:
                             row_line = " | ".join(cells)
                             if any(
@@ -627,21 +789,151 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], max_chars: int = 2
                                 for skip_phrase in ("Unit of Measure:", "Change units", "Click on the graph")
                             ):
                                 continue
-                            rows_out.append(row_line)
-                            tbl_rows += 1
-                        if tbl_rows >= 8 or len(rows_out) >= 35:
+                            tbl_rows_list.append(row_line)
+                        if len(tbl_rows_list) >= 120:
                             break
-                    if len(rows_out) >= 35:
+                    # Keep both head (top rankings) and tail (latest entries in chronological tables like US Presidents)
+                    if len(tbl_rows_list) > 20:
+                        selected_rows = (
+                            tbl_rows_list[:8]
+                            + ["... [Earlier/middle rows omitted] ..."]
+                            + tbl_rows_list[-12:]
+                        )
+                    else:
+                        selected_rows = tbl_rows_list[:20]
+                    rows_out.extend(selected_rows)
+                    # Stop once we have captured a substantial primary data/chronological table on this page
+                    if len(tbl_rows_list) >= 15 or len(rows_out) >= 45:
                         break
                 if len(rows_out) >= 3:
-                    table_text = "\n".join(rows_out)[: max_chars // 2 if extracted_blocks else max_chars]
+                    char_limit = max_chars // 2 if extracted_blocks else max_chars
+                    full_table_text = "\n".join(rows_out)
+                    if len(full_table_text) > char_limit:
+                        half = (char_limit - 40) // 2
+                        table_text = (
+                            full_table_text[:half]
+                            + "\n... [Middle table content omitted] ...\n"
+                            + full_table_text[-half:]
+                        )
+                    else:
+                        table_text = full_table_text
                     extracted_blocks.append(f"[Live Extracted Table from {url}]\n{table_text}")
-                    if len(extracted_blocks) >= 2:
+                    if len(extracted_blocks) >= 3:
                         break
+
+            # Record plain-text fallback from the first valid page in case no URL has a <table>
+            if not fallback_excerpt:
+                body_text = clean_text(re.sub(r"<[^>]+>", " ", raw))
+                if len(body_text) > 250 and not is_junk_snippet(body_text[:400]):
+                    fallback_excerpt = f"[Live Webpage Excerpt from {url}]\n{body_text[:1500]}"
         except Exception:
             continue
 
-    return "\n\n".join(extracted_blocks)[:max_chars] if extracted_blocks else ""
+    if extracted_blocks:
+        return "\n\n".join(extracted_blocks)[:max_chars]
+    return fallback_excerpt[:max_chars]
+
+
+def get_dual_clock_str() -> tuple[str, str, str]:
+    """
+    Returns (today_date_str, local_clock_str, utc_clock_str) using the resolved LOCAL_TZ
+    (e.g. America/Los_Angeles PDT/PST even on headless Etc/UTC Linux servers) with both
+    12-hour and 24-hour representations.
+    """
+    now_local = datetime.now(LOCAL_TZ)
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_local.strftime("%A, %B %d, %Y")
+    local_clock_str = now_local.strftime("%A, %B %d, %Y %I:%M:%S %p (%H:%M:%S) %Z")
+    utc_clock_str = now_utc.strftime("%A, %B %d, %Y %I:%M:%S %p (%H:%M:%S) UTC/GMT")
+    return today_str, local_clock_str, utc_clock_str
+
+
+WORLD_CLOCK_ZONES: list[tuple[str, str, tuple[str, ...]]] = [
+    ("Pacific Time (Los Angeles / Malibu)", "America/Los_Angeles", ("pacific", "pdt", "pst", "los angeles", "malibu", "california", "san francisco", "seattle")),
+    ("Mountain Time (Denver / Phoenix)", "America/Denver", ("mountain", "mdt", "mst", "denver", "utah", "colorado")),
+    ("Central Time (Chicago / Dallas)", "America/Chicago", ("central", "cdt", "cst", "chicago", "dallas", "houston", "texas")),
+    ("Eastern Time (New York / Miami)", "America/New_York", ("eastern", "edt", "est", "new york", "nyc", "boston", "miami", "washington")),
+    ("Hawaii Time (Honolulu)", "Pacific/Honolulu", ("hawaii", "hst", "honolulu", "maui", "lahaina")),
+    ("UTC / GMT", "UTC", ("utc", "gmt", "zulu", "universal")),
+    ("London (UK)", "Europe/London", ("london", "uk", "britain", "bst")),
+    ("Central Europe (Paris / Berlin / Zurich)", "Europe/Paris", ("paris", "berlin", "cet", "cest", "zurich", "madrid", "rome", "europe")),
+    ("Tokyo (Japan)", "Asia/Tokyo", ("tokyo", "japan", "jst")),
+    ("Seoul (South Korea)", "Asia/Seoul", ("seoul", "korea", "kst")),
+    ("Taipei / Hong Kong / Singapore", "Asia/Taipei", ("taipei", "taiwan", "hong kong", "singapore", "beijing", "shanghai")),
+    ("India (IST)", "Asia/Kolkata", ("india", "ist", "mumbai", "bangalore", "delhi")),
+    ("Sydney (Australia)", "Australia/Sydney", ("sydney", "australia", "melbourne", "aest", "aedt")),
+]
+
+
+def is_clock_skill_query(user_input: str) -> bool:
+    """
+    Detects queries asking for the current time, current date, day of the week,
+    calendar offsets ('what day is tomorrow/yesterday'), or world timezone conversions.
+    """
+    u_lower = user_input.lower().strip()
+    clock_patterns = (
+        r"\b(what\s+time\s+is\s+it|what'?s\s+the\s+(?:current\s+)?time|current\s+time|time\s+is\s+it\s+now|time\s+right\s+now|time\s+now)\b",
+        r"\b(what\s+is\s+the\s+(?:current\s+)?(?:date|time)|current\s+date(?:\s*/\s*time|\s+and\s+time)?|today'?s\s+date|what\s+date\s+is\s+(?:it|today))\b",
+        r"\b(what\s+day\s+(?:of\s+the\s+week\s+)?is\s+(?:it|today|tomorrow|yesterday))\b",
+        r"\b(what\s+time\s+is\s+it\s+in\s+[a-z\s]+)\b",
+        r"\b(current\s+time\s+in\s+[a-z\s]+)\b",
+        r"\b(tell\s+me\s+the\s+(?:current\s+)?(?:time|date))\b",
+    )
+    return any(re.search(pat, u_lower) for pat in clock_patterns)
+
+
+def is_external_data_query(user_input: str) -> bool:
+    """Returns True if the query also asks for external web data (weather, surf, tides, stocks, news, buoys)."""
+    u_lower = user_input.lower()
+    return bool(
+        re.search(
+            r"\b(weather|forecast|surf|swell|tide|tides|buoy|ndbc|stock|price|market|dow|nasdaq|s&p|news|score|standings|table|largest|tallest)\b",
+            u_lower,
+        )
+    )
+
+
+def build_live_clock_skill_context(user_input: str) -> tuple[str, str]:
+    """
+    Executes the built-in Current Time, Date & World Clock Skill using the system's atomic
+    NTP-synchronized clock and IANA zoneinfo database.
+    Returns (short_console_status, detailed_skill_block).
+    """
+    now_local = datetime.now(LOCAL_TZ)
+    now_utc = datetime.now(timezone.utc)
+    yesterday_local = now_local - timedelta(days=1)
+    tomorrow_local = now_local + timedelta(days=1)
+
+    short_status = (
+        f"{now_local.strftime('%A, %B %d, %Y • %I:%M:%S %p %Z (%H:%M:%S)')} | "
+        f"UTC: {now_utc.strftime('%H:%M:%S UTC (%a %b %d)')}"
+    )
+
+    u_lower = user_input.lower()
+    world_lines = []
+    for label, iana_name, keywords in WORLD_CLOCK_ZONES:
+        # Always include US zones + UTC, plus any international zone matching the prompt
+        if iana_name in ("America/Los_Angeles", "America/New_York", "UTC") or any(k in u_lower for k in keywords):
+            try:
+                z_dt = now_utc.astimezone(ZoneInfo(iana_name))
+                world_lines.append(f"  • {label}: {z_dt.strftime('%A, %B %d, %Y at %I:%M:%S %p %Z (%H:%M:%S)')}")
+            except Exception:
+                continue
+
+    skill_block = (
+        "--- [SKILL: LIVE SYSTEM CLOCK & CALENDAR (AUTHORITATIVE REAL-TIME GROUNDING)] ---\n"
+        f"• Current Local Date & Time : {now_local.strftime('%A, %B %d, %Y at %I:%M:%S %p %Z (%H:%M:%S, UTC%z)')}\n"
+        f"• Current UTC / GMT Time    : {now_utc.strftime('%A, %B %d, %Y at %I:%M:%S %p UTC (%H:%M:%S GMT)')}\n"
+        f"• Unix Epoch Timestamp      : {int(now_utc.timestamp())}\n"
+        "• Local Calendar Reference  :\n"
+        f"  - Yesterday : {yesterday_local.strftime('%A, %B %d, %Y')}\n"
+        f"  - Today     : {now_local.strftime('%A, %B %d, %Y')}\n"
+        f"  - Tomorrow  : {tomorrow_local.strftime('%A, %B %d, %Y')}\n"
+    )
+    if world_lines:
+        skill_block += "• World Clock Reference     :\n" + "\n".join(world_lines) + "\n"
+    skill_block += "--- [END LIVE SYSTEM CLOCK SKILL] ---"
+    return short_status, skill_block
 
 
 def fetch_web_context(
@@ -658,7 +950,7 @@ def fetch_web_context(
         return "Web search dependency missing. Run `pip install ddgs`."
 
     try:
-        today_str = datetime.now().strftime("%A, %B %d, %Y")
+        today_str, local_clock_str, utc_clock_str = get_dual_clock_str()
         ddgs_client = DDGS()
         rich_cards = fetch_yahoo_rich_cards(query)
 
@@ -667,17 +959,32 @@ def fetch_web_context(
         except Exception:
             text_results = []
 
+        # If DDGS returns empty when a year suffix (e.g. '2026') is attached, retry without the trailing year
+        if len(text_results) < 2 and re.search(r"\b202\d\b", query):
+            stripped_q = re.sub(r"\b202\d\b", "", query).strip()
+            if stripped_q:
+                try:
+                    extra_res = list(ddgs_client.text(stripped_q, max_results=max_results))
+                    for er in extra_res:
+                        if all(er.get("href") != tr.get("href") for tr in text_results):
+                            text_results.append(er)
+                except Exception:
+                    pass
+
         try:
             news_results = list(ddgs_client.news(query, max_results=3))
         except Exception:
             news_results = []
 
-        table_excerpt = fetch_top_page_table_or_excerpt(text_results) if text_results else ""
+        table_excerpt = fetch_top_page_table_or_excerpt(text_results, query=query)
 
         if not rich_cards and not table_excerpt and not text_results and not news_results:
             return "No web search results found."
 
-        context = f"--- CLEANED WEB SEARCH DATA (Retrieved {today_str}) FOR QUERY: '{query}' ---\n"
+        context = (
+            f"--- CLEANED WEB SEARCH DATA (Retrieved Local: {local_clock_str} | Current UTC/GMT: {utc_clock_str}) "
+            f"FOR QUERY: '{query}' ---\n"
+        )
         valid_count = 0
 
         # Prepend rich cards (e.g., live closing prices, after-hours quotes, key stats)
@@ -738,25 +1045,162 @@ def fetch_web_context(
         return f"Failed to retrieve web search context: {e}"
 
 
+def requires_post_cutoff_search(user_input: str) -> bool:
+    """
+    Detects queries about time-sensitive officeholders, political leaders, CEOs, champions,
+    or 'last N / current / latest' sequences that can change after the model's 2024 pre-training
+    cutoff and therefore MUST trigger a live web search.
+    """
+    u_lower = user_input.lower().strip()
+    if is_clock_skill_query(user_input) and not is_external_data_query(user_input):
+        return False
+    office_or_title_pat = (
+        r"\b(president|presidents|vice\s+president|prime\s+minister|governor|mayor|senator|speaker|"
+        r"chancellor|pope|monarch|king|queen|ceo|cfo|chairman|fed\s+chair|secretary\s+of|administration|"
+        r"champion|champions|winner|winners|super\s+bowl|world\s+series|world\s+cup|nba\s+finals|"
+        r"stanley\s+cup|olympics|richest|most\s+valuable|largest\s+market\s+cap)\b"
+    )
+    temporal_qualifier_pat = (
+        r"\b(current|currently|present|incumbent|now|today|latest|recent|most\s+recent|"
+        r"last\s+\d+|past\s+\d+|who\s+is\s+the|who\s+are\s+the|2025|2026)\b"
+    )
+    return bool(re.search(office_or_title_pat, u_lower) and re.search(temporal_qualifier_pat, u_lower))
+
+
+def is_search_opt_out_query(user_input: str) -> bool:
+    """
+    Search-by-Default Opt-Out Guard:
+    Returns True ONLY when the prompt is strictly:
+      1. Built-in clock/calendar skill (without external data requests),
+      2. Pure coding / math / algebra / physics formula evaluation, or
+      3. A formatting, sorting, editing, or memory-recall command operating strictly on previous turns
+         (e.g., 'sort that table', 'make it shorter', 'convert to JSON', 'from our conversation so far').
+    All other prompts default to live web search.
+    """
+    u_lower = user_input.lower().strip()
+
+    # 1. Built-in Current Time & Calendar Skill
+    if is_clock_skill_query(user_input) and not is_external_data_query(user_input):
+        return True
+
+    # Never opt out if the user explicitly asks to search/pull live web data
+    if re.search(r"\b(search\s+the\s+web|pull\s+live|search\s+online|look\s+up\s+online)\b", u_lower):
+        return False
+
+    # 2. Pure coding / scripting / debugging / regex / SQL generation
+    if re.search(
+        r"\b(write\s+a\s+(?:python|bash|sh|c|c\+\+|rust|go|golang|java|javascript|js|typescript|ts|sql|html|css|ruby|perl|script|function|program|class|regex|query)\b|"
+        r"implement\s+a\s+(?:function|class|method|script|algorithm)\b|"
+        r"debug\s+this|refactor\s+this|fix\s+this\s+(?:code|bug|error|script|function)|"
+        r"explain\s+this\s+(?:code|function|regex))\b",
+        u_lower,
+    ) and not re.search(r"\b(noaa|ndbc|buoy\s+\d{5}|yahoo\s+finance)\b", u_lower):
+        return True
+
+    # 3. Pure math, algebra, calculus, textbook physics formulas, or arithmetic on in-context figures
+    if re.search(
+        r"\b(solve\s+for\s+[a-z]\b|derivative\s+of\b|integrate\b|factor\s+the\b|eigenvalue|determinant\s+of\b|"
+        r"electric\s+current\s+in\s+a\s+circuit|ohm'?s\s+law|"
+        r"calculate\s+the\s+deep-water\s+wavelength|deep-water\s+wave\s+formula|"
+        r"using\s+that\s+dominant\s+swell\s+period\b.*calculate|"
+        r"using\s+the\s+exact\s+prices\s+from\s+our\s+conversation|"
+        r"how\s+many\s+whole\s+shares\s+of\s+each\s+can\s+i\s+buy)\b",
+        u_lower,
+    ):
+        return True
+
+    # 4. Formatting, sorting, shortening, converting, or summarizing previous conversation turns
+    if re.search(
+        r"^(sort\s+that|sort\s+the\s+table|make\s+(?:it|that|this|the\s+table)\s+(?:shorter|longer|concise|brief|narrower|wider)|"
+        r"convert\s+(?:that|it|this|those|the\s+table)\s+(?:to|into)\s+(?:json|csv|markdown|yaml|xml|html|bullet|bullets|table|euros|pounds|meters|feet|celsius|fahrenheit)|"
+        r"format\s+(?:that|it|this)\s+as|reformat\s+(?:that|it|this)|rewrite\s+(?:that|it|this)|"
+        r"summarize\s+(?:what\s+we|our\s+conversation|the\s+above|that|it|every\s+stock)|"
+        r"translate\s+(?:that|it|this)\s+(?:to|into)|"
+        r"what\s+were\s+the\s+exact\s+.*(?:we\s+discussed|earlier\s+in\s+our\s+conversation))\b",
+        u_lower,
+    ) or re.search(
+        r"\b(from\s+our\s+conversation\s+so\s+far|we\s+discussed\s+earlier|in\s+our\s+chat\s+history|without\s+searching)\b",
+        u_lower,
+    ):
+        return True
+
+    return False
+
+
+def _build_fallback_search_query(user_input: str, current_year: int) -> str:
+    """Constructs a clean keyword search query from user_input when the LLM router returns NONE or prose."""
+    u_lower = user_input.lower().strip()
+    if re.search(r"\bpresidents?\b", u_lower) and not re.search(
+        r"\b(france|french|mexico|mexican|russia|russian|china|chinese|ukraine|ukrainian|brazil|brazilian|iran|iranian|korea|korean|taiwan|india|indian|argentina|turkey|turkish|poland|polish|philippines|indonesia|south\s+africa|nigeria|egypt|colombia|venezuela|company|university|college|bank|fed|federal\s+reserve|senate|council|board|club)\b",
+        u_lower,
+    ):
+        return "List of presidents of the United States Wikipedia"
+
+    cleaned_fallback = re.sub(
+        r"\b(show\s+me|tell\s+me|can\s+you|could\s+you|what\s+is|what\s+are|who\s+is|who\s+are|where\s+is|when\s+is|how\s+much|the|with|for|create|a|an|table|this|please|format|in|go|and|pull|information|from|publically|publicly|available|data|on)\b",
+        " ",
+        user_input,
+        flags=re.I,
+    )
+    cleaned_fallback = re.sub(r"[?!.,;:\"'`]+", " ", cleaned_fallback)
+    cleaned_fallback = re.sub(r"\s+", " ", cleaned_fallback).strip()
+    base_q = cleaned_fallback[:75] if cleaned_fallback else user_input[:75]
+    if re.search(r"\b(current|currently|present|incumbent|now|today|latest|recent|most\s+recent)\b", u_lower) and str(current_year) not in base_q:
+        base_q = f"{base_q} {current_year}"
+    return base_q.strip()
+
+
 def determine_search_query(user_input: str, history: list) -> str | None:
     """
-    Fast, context-aware classification pass:
-    - Injects today's system date so 'current'/'today'/'latest' queries use the real year (not training cutoff).
-    - Uses recent conversation turns to resolve pronouns ('their', 'it', 'they').
-    - Automatically adapts to the active MODEL_PROFILE (skipping CoT when supported).
+    Search-by-Default Query Formulator (Opt-Out Only for Clock/Code/Math/Formatting):
+    - Instead of asking the model whether it 'needs' web search (which fails whenever facts
+      changed after its 2024 pre-training cutoff), ALWAYS generates a search query unless
+      `is_search_opt_out_query(user_input)` is True or the prompt is strictly a formatting/editing
+      command on the previous turn.
+    - Uses up to the last 3 conversation turn pairs (600 chars/turn) + extracted station/ticker IDs
+      to resolve multi-hop pronouns ('that buoy', 'the second one', 'their', 'for today only instead').
     """
-    today_str = datetime.now().strftime("%A, %B %d, %Y")
-    recent_turns = history[1:][-4:]  # Up to the last 2 user/assistant pairs
+    u_lower = user_input.lower().strip()
+    current_year = datetime.now(LOCAL_TZ).year
+
+    # Fast deterministic opt-out for clock skill, pure coding/math/formulas, or formatting/recall commands
+    if is_search_opt_out_query(user_input):
+        return None
+
+    # Fast deterministic route for US President queries (guarantees authoritative chronological table)
+    if re.search(r"\bpresidents?\b", u_lower) and not re.search(
+        r"\b(france|french|mexico|mexican|russia|russian|china|chinese|ukraine|ukrainian|brazil|brazilian|iran|iranian|korea|korean|taiwan|india|indian|argentina|turkey|turkish|poland|polish|philippines|indonesia|south\s+africa|nigeria|egypt|colombia|venezuela|company|university|college|bank|fed|federal\s+reserve|senate|council|board|club)\b",
+        u_lower,
+    ):
+        return "List of presidents of the United States Wikipedia"
+
+    today_str, _, _ = get_dual_clock_str()
+    recent_turns = history[1:][-6:]  # Up to the last 3 user/assistant pairs
     context_lines = []
+    recent_buoy_matches: list[tuple[str, str]] = []  # (station_id, surrounding_clause)
+
     for msg in recent_turns:
         role_label = "User" if msg.get("role") == "user" else "Assistant"
-        snippet = msg.get("content", "")[:250].replace("\n", " ")
+        raw_content = msg.get("content", "")
+        snippet = raw_content[:600].replace("\n", " ")
         context_lines.append(f"{role_label}: {snippet}")
+        for m_b in re.finditer(r"([^.!\n]{0,45}\b(46\d{3}|41\d{3}|42\d{3}|44\d{3}|51\d{3})\b[^.!\n]{0,65})", raw_content):
+            clause = clean_text(m_b.group(1))
+            st_id = m_b.group(2)
+            if all(st_id != existing_id for existing_id, _ in recent_buoy_matches):
+                recent_buoy_matches.append((st_id, clause))
+
+    entity_hint = ""
+    if recent_buoy_matches:
+        entity_hint = "\nReferenced NOAA Buoy Stations in Context: " + " ; ".join(
+            f"Station {sid} ({cl})" for sid, cl in recent_buoy_matches
+        )
 
     if context_lines:
         eval_input = (
             "Recent Conversation Context:\n"
             + "\n".join(context_lines)
+            + entity_hint
             + f"\n\nLatest User Prompt: {user_input}"
         )
     else:
@@ -767,14 +1211,17 @@ def determine_search_query(user_input: str, history: list) -> str | None:
             {
                 "role": "system",
                 "content": (
-                    f"You are a search intent evaluator. Today's date is {today_str}.\n"
-                    "Determine if the Latest User Prompt requires real-time web search data, "
-                    "stock prices, financial quotes, rankings/tables, recent news, current weather, surf/swell/tide/buoy reports, specific URLs/repositories, product availability, or external specs.\n"
-                    "- Use Recent Conversation Context to resolve pronouns, implicit topic references (e.g., 'for today only instead'), or when previous turns failed to provide the requested data.\n"
-                    f"- When the user asks for 'current', 'latest', or 'today', use the current date/year ({today_str}) in your search query (NEVER use 2023 or 2024).\n"
-                    "- If the user asks to pull data, search, update, verify, or narrow a previous real-time data request (such as 'for today only instead'), ALWAYS output a search query combining the topic from Recent Conversation Context with the Latest User Prompt.\n"
-                    "- If search IS NOT needed (math, coding, reasoning, established general knowledge, or follow-up analysis of facts already stated), reply ONLY with 'NONE'.\n"
-                    "- If search IS needed, reply ONLY with a concise 2-8 word web search query (NO explanations or preamble)."
+                    f"You are a search query formulator. Today's date is {today_str} (Year: {current_year}).\n"
+                    "We operate in SEARCH-BY-DEFAULT mode because your internal pre-training weights ended in 2024.\n"
+                    "- ALWAYS output a concise 2-10 word web search query for the Latest User Prompt UNLESS the prompt is strictly:\n"
+                    "  (1) Pure code generation or debugging ('write a Python script...'),\n"
+                    "  (2) Pure math, algebra, or physics formula evaluation on already-provided numbers, or\n"
+                    "  (3) A formatting, sorting, shortening, or conversion command on the previous turn ('sort that table', 'make it shorter', 'convert to JSON').\n"
+                    "- For ALL factual, historical, scientific, entity, leader/president/CEO, product, financial, weather, or ocean buoy prompts, NEVER output 'NONE' — formulate the best 2-10 word web search query.\n"
+                    "- Use Recent Conversation Context to resolve pronouns and implicit references (e.g., 'for today only instead', 'that buoy', 'the second one', 'their CEO').\n"
+                    "- When Recent Conversation Context contains a specific 5-digit NOAA buoy station ID (e.g., 46221, 46054, 46218) that matches the buoy referenced by the user, ALWAYS include that exact 5-digit station ID (e.g. 'NOAA buoy 46054 wave height water temp') in your search query.\n"
+                    f"- When the user asks for 'current', 'latest', 'present', or 'today', include {current_year} in your search query (NEVER use 2023 or 2024).\n"
+                    "- Reply ONLY with the concise 2-10 word web search query (or 'NONE' ONLY for pure code/math/formatting). No explanations or full sentences."
                 ),
             },
             {"role": "user", "content": eval_input},
@@ -794,7 +1241,7 @@ def determine_search_query(user_input: str, history: list) -> str | None:
         response = client.chat.completions.create(**create_kwargs)
         res_text = strip_thinking_and_dedup(response.choices[0].message.content or "")
         if not res_text:
-            return None
+            return _build_fallback_search_query(user_input, current_year)
 
         # If the model included a label like "Search Query:", extract what follows
         for marker in ("Search Query:", "search query:", "Query:", "query:"):
@@ -805,44 +1252,121 @@ def determine_search_query(user_input: str, history: list) -> str | None:
         res_text = lines[-1] if lines else ""
 
         if not res_text or res_text.upper().startswith("NONE") or res_text.upper() == "NONE":
-            return None
+            # In Search-by-Default mode, only honor NONE if the prompt looks like a follow-up edit/calculation/code request;
+            # otherwise override NONE with a fallback keyword query so 2024 cutoff blindness can never suppress search.
+            if re.search(
+                r"\b(sort|reformat|shorten|summarize|translate|rewrite|convert|calculate|compute|code|script|function|equation|formula|earlier|previous|above)\b",
+                u_lower,
+            ) and not is_external_data_query(user_input) and not requires_post_cutoff_search(user_input):
+                return None
+            return _build_fallback_search_query(user_input, current_year)
 
-        # Guard against leaked reasoning sentences being sent to DuckDuckGo
+        # Guard against leaked reasoning sentences or declarative answers ("The current ... is ...") being sent to DuckDuckGo
         lower_q = res_text.lower()
-        if len(res_text.split()) > 12 or any(
+        is_declarative_answer = bool(
+            re.match(r"^the\s+(current|last|latest|present)\b.*\b(is|are|was|were)\b", lower_q)
+            or res_text.endswith(".")
+        )
+        if is_declarative_answer or len(res_text.split()) > 12 or any(
             phrase in lower_q
             for phrase in ("to determine", "i'll analyze", "i will analyze", "the user is asking", "user's request")
         ):
-            # Fallback: extract clean keywords from user_input
-            cleaned_fallback = re.sub(
-                r"\b(show me|the|with|for|create|a|table|this|please|format|in|go|and|pull|information|from|publically|available|data|on)\b",
-                " ",
-                user_input,
-                flags=re.I,
-            )
-            cleaned_fallback = re.sub(r"\s+", " ", cleaned_fallback).strip()
-            return cleaned_fallback[:80] if cleaned_fallback else user_input[:80]
+            res_text = _build_fallback_search_query(user_input, current_year)
 
-        return res_text.replace('"', "").replace("'", "")
+        res_text = res_text.replace('"', "").replace("'", "")
+
+        # Ensure generic "president" queries default to United States President rather than film/book titles
+        if "president" in u_lower and not any(
+            c in res_text.lower() for c in ("united states", "u.s", "usa", "france", "mexico", "russia", "china", "ukraine", "brazil", "iran", "korea", "taiwan")
+        ):
+            res_text = f"United States {res_text}"
+
+        # Post-processing: if query is about a buoy from recent context but lacks the 5-digit ID, attach the matching ID
+        if recent_buoy_matches and "buoy" in res_text.lower() and not re.search(r"\b\d{5}\b", res_text):
+            q_words = set(re.findall(r"[a-z]{4,}", (res_text + " " + " ".join(context_lines[-2:])).lower()))
+            best_id = None
+            best_overlap = 0
+            for sid, cl in recent_buoy_matches:
+                cl_words = set(re.findall(r"[a-z]{4,}", cl.lower())) - {"station", "located", "buoy", "near"}
+                overlap = len(q_words & cl_words)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_id = sid
+            if not best_id and len(recent_buoy_matches) == 1:
+                best_id = recent_buoy_matches[0][0]
+            if best_id:
+                res_text = f"NOAA buoy {best_id} {res_text}"
+
+        return res_text
     except Exception:
-        return None
+        return _build_fallback_search_query(user_input, current_year)
 
 
-def compress_memory(existing_summary: str, old_user: str, old_assistant: str) -> str:
+def needs_quantitative_reasoning(user_input: str) -> bool:
     """
-    Uses a non-thinking completion pass to fold overflowing turn pairs into the summary buffer
-    without leaking Chain-of-Thought into the system prompt.
+    Detects prompts that require multi-step arithmetic, portfolio share allocation,
+    unit conversion, or physics/engineering formula evaluation so the harness can
+    instruct the model to show explicit intermediate equations even when think_mode is OFF.
     """
+    u_lower = user_input.lower()
+    if re.search(
+        r"\b(write\s+a\s+(?:python|bash|sh|c|c\+\+|rust|go|golang|java|javascript|js|typescript|ts|sql|html|css|script|function|program|class)|implement\s+a\s+(?:function|class|method|script|algorithm))\b",
+        u_lower,
+    ):
+        return False
+    quant_patterns = (
+        r"\b(calculate|compute|derive|solve|formula|equation|wavelength|phase\s+speed)\b",
+        r"\b(how\s+many\s+(?:whole\s+)?shares|left\s+over|remainder|split\s+\d+\s*/\s*\d+|allocation)\b",
+        r"\b(ratio\s+of|percentage\s+difference|compound\s+annual|cagr|standard\s+deviation)\b",
+        r"\b(convert\b.*\bto\b.*\band\b|in\s+both\s+(?:utc|gmt|meters|feet|knots))\b",
+        r"\b(minutes\s+ago|hours\s+ago|how\s+long\s+ago)\b",
+        r"\$\s*\d[\d,]*(?:\.\d+)?",
+    )
+    return any(re.search(pat, u_lower) for pat in quant_patterns)
+
+
+def estimate_history_tokens(history: list[dict]) -> int:
+    """Approximates verbatim history token count (~4 chars/token) excluding the system prompt."""
+    return sum(len(m.get("content", "")) for m in history[1:]) // 4
+
+
+def compress_memory_batch(existing_summary: str, evicted_pairs: list[tuple[str, str]]) -> str:
+    """
+    Folds a batch of overflowing (user, assistant) turn pairs into the summary buffer in a
+    single non-thinking LLM call, preserving all exact numerical figures, tickers, timestamps,
+    and station IDs verbatim while avoiding per-turn KV prefix-cache invalidation.
+    """
+    if not evicted_pairs:
+        return existing_summary
+
+    turns_block = "\n\n".join(
+        f"Turn {idx + 1}:\nUser: {u_txt}\nAssistant Answer: {a_txt}"
+        for idx, (u_txt, a_txt) in enumerate(evicted_pairs)
+    )
     prompt = (
         f"Existing Conversation Summary:\n{existing_summary if existing_summary else 'None'}\n\n"
-        f"Turn to Integrate:\nUser: {old_user}\nAssistant Answer: {old_assistant}\n\n"
-        "Provide an updated, concise summary (2-4 sentences max) capturing key entities, user requirements, "
-        "and core conclusions. Do NOT include meta-commentary, disclaimers, or web search boilerplate."
+        f"New Turns to Integrate ({len(evicted_pairs)} turn(s)):\n{turns_block}\n\n"
+        "Produce an updated, dense bulleted memory log (up to 15 concise bullets) that:\n"
+        "1. Retains all existing facts and topics from Existing Conversation Summary.\n"
+        "2. Integrates the New Turns while preserving EVERY exact number, stock price, point/percentage change, "
+        "wave height, wave period, wave direction, temperature, date/time, ticker symbol, and 5-digit buoy station ID verbatim.\n"
+        "3. NEVER replaces specific numbers with vague prose (for example, write "
+        "'Buoy 46221: WVHT 3.6 ft (1.1 m), DPD 14 sec, APD 6.9 sec, MWD 284 deg, WTMP 63.1°F; "
+        "^DJI 47,951.85 (-0.28%), ^GSPC 7,089.14 (-0.25%), ^IXIC 23,825.46 (-0.83%)' instead of 'provided buoy and index readings').\n"
+        "Output ONLY the bulleted list with no preamble or meta-commentary."
     )
     try:
-        console.print("[dim]Updating rolling memory summary buffer...[/dim]")
+        console.print(
+            f"[dim]Batch-compressing {len(evicted_pairs)} oldest turn pair(s) into rolling summary buffer...[/dim]"
+        )
         base_messages = [
-            {"role": "system", "content": "You are a concise conversation memory summarizer."},
+            {
+                "role": "system",
+                "content": (
+                    "You are a high-precision numerical conversation memory archivist. "
+                    "You never drop or round away exact numbers, tickers, or station IDs when summarizing."
+                ),
+            },
             {"role": "user", "content": prompt},
         ]
         req_messages, extra_params = prepare_request_messages_and_extra(
@@ -852,7 +1376,7 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
             "model": MODEL_NAME,
             "messages": req_messages,
             "temperature": 0.0,
-            "max_tokens": 400,
+            "max_tokens": 700,
         }
         if extra_params:
             create_kwargs["extra_body"] = extra_params
@@ -864,8 +1388,513 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
     except Exception:
         pass
 
-    entry = f"User asked: '{old_user}' | Assistant answered: '{old_assistant[:120]}...'"
-    return f"{existing_summary}\n- {entry}" if existing_summary else f"- {entry}"
+    fallback_entries = "\n".join(
+        f"- User asked: '{u_txt}' | Assistant answered: '{a_txt[:240]}...'" for u_txt, a_txt in evicted_pairs
+    )
+    return f"{existing_summary}\n{fallback_entries}" if existing_summary else fallback_entries
+
+
+def compress_memory(existing_summary: str, old_user: str, old_assistant: str) -> str:
+    """Single-pair wrapper around compress_memory_batch for backward compatibility."""
+    return compress_memory_batch(existing_summary, [(old_user, old_assistant)])
+
+
+def detect_auto_parallel_sections(user_input: str) -> list[str] | None:
+    """
+    Automatically detects when a user prompt naturally decomposes into 2 to 6 independent parallel
+    sections without requiring any slash command:
+      1. Explicit numbered sub-questions: `1) ... 2) ...`
+      2. Multi-ticker / multi-company comparisons (>= 2 tickers/companies)
+      3. Multi-topic comma-separated explanations/lists (`Explain/List/Compare A, B, and C`)
+    """
+    # 1. Explicit numbered sub-tasks: "1) ... 2) ..."
+    numbered = re.findall(
+        r"(?:^|\s)(?:\d+[\)\.]\s*)([^0-9\n][^\n\?;]{6,120}?)(?=(?:\s+\d+[\)\.]\s+)|$)",
+        user_input.strip(),
+    )
+    if 2 <= len(numbered) <= 6:
+        return [clean_text(item).rstrip(".,;") for item in numbered]
+
+    u_lower = user_input.lower().strip()
+
+    # 2. Multi-ticker / multi-company comparison of >= 2 tickers
+    if re.search(r"\b(compare|comparison|analyze|breakdown|break\s+down|contrast|detailed|evaluate|outlook)\b", u_lower):
+        tickers = []
+        for tok in re.findall(r"\b[A-Z]{2,5}\b", user_input):
+            if tok not in _TICKER_STOPWORDS and tok not in tickers:
+                tickers.append(tok)
+        for name_key, (sym, _) in _KNOWN_COMPANY_TICKERS.items():
+            if re.search(rf"\b{re.escape(name_key)}\b", u_lower) and sym not in tickers:
+                tickers.append(sym)
+        if 2 <= len(tickers) <= 5:
+            sections = [f"{sym} — Live Quote, Performance & Key Metrics Analysis" for sym in tickers]
+            sections.append(f"Side-by-Side Comparison Table & Relative Summary ({', '.join(tickers)})")
+            return sections
+
+    # 3. Comma-separated multi-topic explanations/lists: "Explain/Describe/Compare/List A, B, and C"
+    m_list = re.match(
+        r"^(?:please\s+)?(?:explain|describe|compare|detail|break\s+down|summarize|list|show|tabulate)\s+(?:all\s+(?:of\s+)?(?:the\s+)?)?(?:the\s+(?:differences\s+between|following\s+topics|concepts\s+of)\s*:?\s*)?(.+)$",
+        user_input.strip(),
+        flags=re.I,
+    )
+    if m_list and "," in m_list.group(1):
+        tail = re.sub(r",?\s+in\s+a\s+table.*$", "", m_list.group(1).strip(), flags=re.I).rstrip(".?!")
+        raw_items = re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", tail)
+        clean_items = [it.strip() for it in raw_items if 4 <= len(it.strip()) <= 75 and len(it.strip().split()) <= 10]
+        if 3 <= len(clean_items) <= 5:
+            return clean_items
+
+    return None
+
+
+def plan_parallel_sections(user_input: str) -> list[str] | None:
+    """
+    Feature A — Automatic Section-Parallel / Map-Reduce Planner:
+    Automatically returns a list of 2-5 independent section titles when a prompt is a multi-part,
+    multi-entity ('X and Y'), exhaustive enumeration ('List all... in a table'), or comprehensive
+    deep-dive request; returns `None` for normal single-stream prompts.
+    """
+    if is_search_opt_out_query(user_input):
+        return None
+
+    auto_secs = detect_auto_parallel_sections(user_input)
+    if auto_secs:
+        return auto_secs
+
+    u_lower = user_input.lower().strip()
+    is_deep_dive = bool(
+        re.search(
+            r"\b(comprehensive\s+(?:guide|overview|breakdown|analysis)|in-depth\s+(?:guide|analysis|breakdown|explanation)|detailed\s+(?:guide|breakdown|architectural\s+overview)|multi-section|step-by-step\s+guide\s+to\s+building)\b",
+            u_lower,
+        )
+    )
+    is_multi_entity_or_exhaustive_table = bool(
+        re.search(
+            r"\b(list\s+all|all\s+of\s+the|every\s+named|complete\s+(?:list|table)|table\s+of\s+all)\b",
+            u_lower,
+        )
+        or (
+            re.search(r"\b(in\s+a\s+table|as\s+a\s+table|side-by-side\s+table)\b", u_lower)
+            and re.search(r"\b(and|vs\.?|versus|both)\b", u_lower)
+        )
+        or re.search(
+            r"^(?:please\s+)?(?:list|compare|contrast|tabulate)\s+(?:all\s+(?:of\s+)?(?:the\s+)?)?.+\b(?:of|for|between)\s+[A-Z][a-zA-Z0-9\-]+\s+and\s+[A-Z][a-zA-Z0-9\-]+",
+            user_input.strip(),
+        )
+    )
+    if not (is_deep_dive or is_multi_entity_or_exhaustive_table):
+        return None
+
+    try:
+        base_messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Decompose the user's request into 4 distinct, non-overlapping section titles "
+                    "(or 2-3 if the topic only has 2-3 small parts) that can be generated in parallel by separate worker streams.\n"
+                    "- IMPORTANT: When the user asks to 'List all...' for 2 large categories (such as 'named moons of Saturn and Jupiter', "
+                    "which each have 50+ named moons), ALWAYS split each category into 2 logical sub-sections (4 sections total: "
+                    "e.g., 'Named Moons of Saturn — Major & Inner Regular Moons', 'Named Moons of Saturn — Irregular Outer Moons (Inuit, Gallic & Norse Groups)', "
+                    "'Named Moons of Jupiter — Inner, Galilean & Prograde Moons', 'Named Moons of Jupiter — Retrograde Outer Moons (Ananke, Carme & Pasiphae Groups)') "
+                    "so 4 parallel streams share the table generation load.\n"
+                    "- Output ONLY the section titles, one per line (no numbering, no bullets, no preamble)."
+                ),
+            },
+            {"role": "user", "content": user_input},
+        ]
+        req_messages, extra_params = prepare_request_messages_and_extra(
+            base_messages, use_thinking=False, is_utility_call=True
+        )
+        create_kwargs = {
+            "model": MODEL_NAME,
+            "messages": req_messages,
+            "temperature": 0.0,
+            "max_tokens": 110,
+        }
+        if extra_params:
+            create_kwargs["extra_body"] = extra_params
+
+        resp = client.chat.completions.create(**create_kwargs)
+        raw = strip_thinking_and_dedup(resp.choices[0].message.content or "")
+        lines = []
+        for ln in raw.splitlines():
+            cleaned_ln = re.sub(r"^[\s\-\*\d\.\)\:]+", "", ln).strip().strip("*\"'`")
+            if len(cleaned_ln) >= 4:
+                lines.append(cleaned_ln[:90])
+        if 2 <= len(lines) <= 5:
+            return lines[:5]
+    except Exception:
+        pass
+
+    return [
+        "Core Overview & Fundamental Principles",
+        "Architecture & Underlying Mechanics",
+        "Quantitative Performance & Practical Trade-offs",
+        "Summary Synthesis & Key Takeaways",
+    ]
+
+
+class _BoundedMarkdownView:
+    """
+    Hybrid 50-Line Transient Live Streaming View:
+    Renders live formatted `Markdown(md_text)` + a 1-line status bar clamped to at most `max_lines`
+    (default 50 lines, dynamically bounded by `console.size.height - 2` so it never overflows a smaller
+    SSH terminal window). If the in-progress Markdown exceeds the line budget, keeps the bottom (newest)
+    lines visible so `rich.live.Live` never pushes duplicate frames into the SSH scrollback buffer.
+    """
+
+    def __init__(self, md_text: str, status_line: Text, max_lines: int = 50):
+        self.md_text = md_text
+        self.status_line = status_line
+        self.max_lines = max_lines
+
+    def __rich_console__(self, console_obj: Console, options):
+        from rich.segment import Segment
+
+        avail_height = min(self.max_lines, max(4, console_obj.size.height - 2))
+        body_budget = max(1, avail_height - 1)
+        if self.md_text and self.md_text.strip():
+            rendered_lines = console_obj.render_lines(Markdown(self.md_text), options, pad=False)
+            if len(rendered_lines) > body_budget:
+                rendered_lines = rendered_lines[-body_budget:]
+            new_line = Segment.line()
+            for line_segments in rendered_lines:
+                yield from line_segments
+                yield new_line
+        yield self.status_line
+
+
+class ProgressiveMarkdownStreamer:
+    """
+    Hybrid 50-Line Transient Live Streamer + Once-Only Progressive Markdown Block Commits:
+    1. While the response is generating, displays up to 50 lines (`max_live_lines = 50`, safely bounded by
+       `console.size.height - 2`) of live-rendered Markdown inside a `transient=True` `Live` window so the
+       user can read the full streaming content in real time.
+    2. If a long response exceeds the 50-line window while still streaming, completed top-level Markdown
+       blocks (`\\n\\n` boundaries outside code fences/tables/lists) are progressively committed ONCE to
+       scrollback above the transient window so the live region never overflows the viewport.
+    3. As soon as the response completes, the transient 50-line live window clears (`transient=True`) and
+       switches to Once-Only Progressive Markdown Block Commits (`finish`), printing all remaining blocks
+       permanently into the SSH scrollback buffer for indefinite review.
+    """
+
+    def __init__(self, target_console: Console, max_live_lines: int = 50):
+        self.console = target_console
+        self.max_live_lines = max_live_lines
+        self.committed_char_len = 0
+        self.token_count = 0
+
+    @staticmethod
+    def _is_table_line(line: str) -> bool:
+        s = line.strip()
+        return s.startswith("|") or (s.count("|") >= 2 and not s.startswith(("http", "//")))
+
+    @staticmethod
+    def _is_list_line(line: str) -> bool:
+        return bool(
+            re.match(
+                r"^(\s*[-*•+]\s+|\s*\d+[\.\)]\s+|\s+[^\s])",
+                line,
+            )
+        )
+
+    def _find_safe_commit_boundary(self, uncommitted: str) -> int:
+        """
+        Returns the character index `idx` in `uncommitted` up to which complete Markdown blocks
+        can be permanently printed without splitting an in-progress code fence, table, or list.
+        Returns 0 if no complete block boundary is ready yet.
+        """
+        if "\n\n" not in uncommitted:
+            return 0
+
+        search_pos = 0
+        best_cut = 0
+
+        while True:
+            sep_idx = uncommitted.find("\n\n", search_pos)
+            if sep_idx == -1:
+                break
+            after_sep = sep_idx + 2
+            # Require at least 2 non-newline characters after `\n\n` so we can inspect what starts next
+            remainder = uncommitted[after_sep:]
+            remainder_stripped = remainder.lstrip("\n")
+            if len(remainder_stripped) < 2 or "\n" not in remainder_stripped:
+                break
+
+            candidate = uncommitted[:sep_idx]
+            next_first_line = remainder_stripped.split("\n", 1)[0]
+
+            # 1. Never split inside an unclosed ``` code fence
+            if candidate.count("```") % 2 == 1:
+                search_pos = after_sep
+                continue
+
+            # 2. Never split inside an ongoing Markdown table
+            cand_lines = [ln for ln in candidate.splitlines() if ln.strip()]
+            last_line = cand_lines[-1] if cand_lines else ""
+            if self._is_table_line(last_line) and self._is_table_line(next_first_line):
+                search_pos = after_sep
+                continue
+
+            # 3. Never split inside an ongoing bullet/numbered list unless the next block is a heading/rule
+            if (
+                self._is_list_line(last_line)
+                and self._is_list_line(next_first_line)
+                and not next_first_line.lstrip().startswith(("#", "---"))
+            ):
+                search_pos = after_sep
+                continue
+
+            # 4. Never split a standalone heading from its body paragraph
+            if last_line.lstrip().startswith("#"):
+                search_pos = after_sep
+                continue
+
+            best_cut = after_sep
+            search_pos = after_sep
+
+        return best_cut
+
+    def make_status_line(self, tail_text: str = "", prefix_label: str = "⚡ Streaming") -> Text:
+        line = Text(no_wrap=True, overflow="ellipsis")
+        line.append(f"{prefix_label} ({self.token_count} tok)", style="bold cyan")
+        return line
+
+    def step(self, live: Live, display_text: str, prefix_label: str = "⚡ Streaming"):
+        self.token_count += 1
+        if len(display_text) < self.committed_char_len:
+            self.committed_char_len = 0
+
+        uncommitted = display_text[self.committed_char_len :]
+        avail_height = min(self.max_live_lines, max(4, self.console.size.height - 2))
+        body_budget = max(1, avail_height - 1)
+
+        # Keep the live streaming content inside the 50-line transient window until it completes;
+        # only commit early if the uncommitted Markdown grows past the 50-line (or viewport) budget!
+        if uncommitted.strip():
+            rendered_lines = self.console.render_lines(Markdown(uncommitted), self.console.options, pad=False)
+            if len(rendered_lines) > body_budget:
+                cut = self._find_safe_commit_boundary(uncommitted)
+                if cut > 0:
+                    block_to_commit = uncommitted[:cut].strip()
+                    if block_to_commit:
+                        live.console.print(Markdown(block_to_commit))
+                        live.console.print()
+                    self.committed_char_len += cut
+                    uncommitted = display_text[self.committed_char_len :]
+
+        status_line = self.make_status_line(uncommitted, prefix_label=prefix_label)
+        live.update(_BoundedMarkdownView(uncommitted, status_line, max_lines=self.max_live_lines))
+
+    def finish(self, display_text: str):
+        """
+        Once-Only Progressive Markdown Block Commits after response completion:
+        Commits all remaining Markdown blocks permanently into the terminal scrollback buffer.
+        """
+        if len(display_text) < self.committed_char_len:
+            self.committed_char_len = 0
+        uncommitted = display_text[self.committed_char_len :]
+        while True:
+            cut = self._find_safe_commit_boundary(uncommitted)
+            if cut <= 0:
+                break
+            block_to_commit = uncommitted[:cut].strip()
+            if block_to_commit:
+                self.console.print(Markdown(block_to_commit))
+                self.console.print()
+            self.committed_char_len += cut
+            uncommitted = display_text[self.committed_char_len :]
+
+        remainder = uncommitted.strip()
+        if remainder:
+            self.console.print(Markdown(remainder))
+
+
+def stream_parallel_sections(
+    base_prefix_messages: list[dict],
+    shared_active_user_content: str,
+    sections: list[str],
+    use_thinking: bool,
+    verbose_flag: bool = False,
+) -> tuple[str, float, float, int, float, float]:
+    """
+    Feature A — Section-Parallel / Map-Reduce Executor (Scrollback-Safe):
+    Launches N simultaneous streaming requests (1 per section). While all N streams decode in parallel,
+    displays a single-line non-wrapping status bar (`transient=True`) so zero jitter or scrollback
+    corruption occurs over SSH, then prints each completed section permanently in order (1..N) as soon
+    as it is ready!
+    Returns (combined_response, ttft_ms, gen_duration, total_tokens, effective_tps, avg_stream_tps).
+    """
+    n_streams = len(sections)
+    section_buffers = ["" for _ in range(n_streams)]
+    section_tokens = [0 for _ in range(n_streams)]
+    section_first_t: list[float | None] = [None for _ in range(n_streams)]
+    section_end_t: list[float | None] = [None for _ in range(n_streams)]
+    section_done = [False for _ in range(n_streams)]
+    section_printed = [False for _ in range(n_streams)]
+    lock = threading.Lock()
+    start_time = time.perf_counter()
+
+    is_exhaustive_list = bool(
+        re.search(r"\b(list\s+all|all\s+of\s+the|every|complete|in\s+a\s+table|table)\b", shared_active_user_content.lower())
+    )
+    per_stream_max_tokens = min(1400 if is_exhaustive_list else 750, MODEL_PROFILE["max_gen_tokens"])
+
+    def _run_section_stream(idx: int, sec_title: str):
+        other_titles = ", ".join(f"'{s}'" for j, s in enumerate(sections) if j != idx)
+        length_guidance = (
+            f"- Provide a complete, accurate Markdown table for `{sec_title}` combining the web search context with verified internal reference knowledge (never invent or guess names)."
+            if is_exhaustive_list
+            else f"- Focus exclusively on `{sec_title}` (~150–250 words, using Markdown tables or bullets where helpful)."
+        )
+        tail_assignment = (
+            f"\n\n### PARALLEL STREAM ASSIGNMENT (Section {idx + 1} of {n_streams}):\n"
+            f"You are Stream {idx + 1} of {n_streams} generating a multi-section response in parallel.\n"
+            f"Write ONLY Section {idx + 1}: **{sec_title}**.\n"
+            f"- Start directly with the Markdown heading `### {idx + 1}. {sec_title}`.\n"
+            f"{length_guidance}\n"
+            f"- Do NOT cover the other parallel sections ({other_titles}) and do NOT include a generic intro or conclusion."
+        )
+        sec_payload = list(base_prefix_messages) + [
+            {"role": "user", "content": shared_active_user_content + tail_assignment}
+        ]
+        active_sec_msgs, extra_sec_params = prepare_request_messages_and_extra(
+            sec_payload, use_thinking=use_thinking, is_utility_call=False
+        )
+        if idx == 0 and verbose_flag:
+            console.print(
+                Panel(
+                    json.dumps(active_sec_msgs, indent=2),
+                    title=f"[bold yellow]EXACT vLLM Parallel Payload (Stream 1 of {n_streams})[/bold yellow]",
+                    border_style="yellow",
+                    expand=False,
+                )
+            )
+        stream_kwargs = {
+            "model": MODEL_NAME,
+            "messages": active_sec_msgs,
+            "temperature": 0.6 if use_thinking else 0.7,
+            "max_tokens": per_stream_max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        if extra_sec_params:
+            stream_kwargs["extra_body"] = extra_sec_params
+
+        try:
+            stream = client.chat.completions.create(**stream_kwargs)
+            for chunk in stream:
+                if chunk.choices and len(chunk.choices) > 0:
+                    delta = chunk.choices[0].delta.content or ""
+                    if delta:
+                        now_t = time.perf_counter()
+                        with lock:
+                            if section_first_t[idx] is None:
+                                section_first_t[idx] = now_t
+                            section_buffers[idx] += delta
+                if hasattr(chunk, "usage") and chunk.usage:
+                    with lock:
+                        section_tokens[idx] = chunk.usage.completion_tokens
+        except Exception as e:
+            with lock:
+                section_buffers[idx] += f"\n*(Stream {idx + 1} error: {e})*"
+        finally:
+            with lock:
+                section_end_t[idx] = time.perf_counter()
+                if section_tokens[idx] == 0 and section_buffers[idx]:
+                    section_tokens[idx] = max(1, len(section_buffers[idx]) // 4)
+                section_done[idx] = True
+
+    def _format_single_section(idx: int) -> str:
+        title = sections[idx]
+        cleaned_sec = strip_thinking_and_dedup(section_buffers[idx])
+        if cleaned_sec:
+            if not cleaned_sec.lstrip().startswith("#"):
+                cleaned_sec = f"### {idx + 1}. {title}\n{cleaned_sec}"
+            return cleaned_sec
+        return f"### {idx + 1}. {title}\n*(No content)*"
+
+    def _make_parallel_live_view(start_sec_idx: int) -> _BoundedMarkdownView:
+        with lock:
+            badges = []
+            total_chars = 0
+            preview_parts = []
+            for i in range(n_streams):
+                n_tok_est = section_tokens[i] or (len(section_buffers[i]) // 4)
+                total_chars += len(section_buffers[i])
+                state = "✓" if section_done[i] else f"{n_tok_est}t"
+                badges.append(f"S{i + 1}:{state}")
+                if i >= start_sec_idx and section_buffers[i].strip():
+                    cleaned_part = strip_thinking_and_dedup(section_buffers[i])
+                    if cleaned_part:
+                        if not cleaned_part.lstrip().startswith("#"):
+                            cleaned_part = f"### {i + 1}. {sections[i]}\n{cleaned_part}"
+                        preview_parts.append(cleaned_part)
+            status_str = " ".join(badges)
+            live_md = "\n\n---\n\n".join(preview_parts)
+        line = Text(no_wrap=True, overflow="ellipsis")
+        line.append(f"⚡ Parallel Map-Reduce ({n_streams} streams | ~{total_chars // 4} tok): ", style="bold cyan")
+        line.append(status_str, style="dim")
+        return _BoundedMarkdownView(live_md, line, max_lines=50)
+
+    threads = [
+        threading.Thread(target=_run_section_stream, args=(i, sec_title), daemon=True)
+        for i, sec_title in enumerate(sections)
+    ]
+    for t in threads:
+        t.start()
+
+    next_to_print = 0
+    with Live(
+        _make_parallel_live_view(0),
+        console=console,
+        refresh_per_second=8,
+        transient=True,
+    ) as live:
+        while not all(section_done):
+            # Permanently print completed sections in sequential order (0, 1, 2, ...) as soon as each finishes!
+            while next_to_print < n_streams and section_done[next_to_print]:
+                with lock:
+                    sec_md = _format_single_section(next_to_print)
+                    section_printed[next_to_print] = True
+                if next_to_print > 0:
+                    live.console.print(Markdown("---"))
+                live.console.print(Markdown(sec_md))
+                live.console.print()
+                next_to_print += 1
+            live.update(_make_parallel_live_view(next_to_print))
+            time.sleep(0.08)
+
+        while next_to_print < n_streams:
+            with lock:
+                sec_md = _format_single_section(next_to_print)
+                section_printed[next_to_print] = True
+            if next_to_print > 0:
+                live.console.print(Markdown("---"))
+            live.console.print(Markdown(sec_md))
+            live.console.print()
+            next_to_print += 1
+
+    for t in threads:
+        t.join(timeout=1.0)
+
+    end_time = time.perf_counter()
+    valid_firsts = [t for t in section_first_t if t is not None]
+    first_token_t = min(valid_firsts) if valid_firsts else end_time
+    ttft_ms = (first_token_t - start_time) * 1000.0
+    gen_duration = max(0.001, end_time - first_token_t)
+    total_tokens = sum(section_tokens)
+    effective_tps = total_tokens / gen_duration
+
+    per_stream_rates = []
+    for i in range(n_streams):
+        if section_first_t[i] and section_end_t[i] and section_end_t[i] > section_first_t[i]:
+            per_stream_rates.append(section_tokens[i] / (section_end_t[i] - section_first_t[i]))
+    avg_stream_tps = sum(per_stream_rates) / len(per_stream_rates) if per_stream_rates else (effective_tps / n_streams)
+
+    final_parts = [_format_single_section(i) for i in range(n_streams)]
+    combined_response = "\n\n---\n\n".join(final_parts)
+    return combined_response, ttft_ms, gen_duration, total_tokens, effective_tps, avg_stream_tps
 
 
 # --- Session Startup ---
@@ -890,15 +1919,18 @@ if not start_file:
 
 conversation_history, summary_buffer = re_hydrate_cache(start_file)
 
-CURRENT_DATE_STR = datetime.now().strftime("%A, %B %d, %Y")
+CURRENT_DATE_STR, CURRENT_LOCAL_CLOCK_STR, CURRENT_UTC_CLOCK_STR = get_dual_clock_str()
+LOCAL_TZ_LABEL = datetime.now(LOCAL_TZ).strftime("%Z (UTC%z)")
 BASE_SYSTEM_PROMPT = (
-    f"You are an intelligent, concise AI assistant. Today's date is {CURRENT_DATE_STR}. "
+    f"You are an intelligent, concise AI assistant. Today's local date is {CURRENT_DATE_STR} "
+    f"(Local Timezone: {LOCAL_TZ_LABEL}). "
     "Prioritize answering the user's latest message directly and accurately, "
     "while using prior conversation turns to resolve follow-up references and maintain continuity. "
     "Treat the Prior Conversation Summary Buffer as background context. "
-    "When web search data is provided, always prefer the live retrieved figures and tables over pre-training knowledge. "
+    "When a [SKILL: LIVE SYSTEM CLOCK & CALENDAR] block or live web search data is provided in the active turn, "
+    "always report the exact live timestamps, dates, figures, and tables from that block over pre-training knowledge or older turns. "
     "NEVER invent, estimate, or generate placeholder tables or figures when real-time data is requested; "
-    "report only the exact measurements present in the retrieved web data."
+    "report only the exact measurements present in the retrieved data."
 )
 
 if conversation_history is None:
@@ -919,7 +1951,9 @@ verbose_mode = False
 think_mode = bool(args.think)
 
 console.print("\n[bold]Commands:[/bold]")
-console.print(f"  [cyan]Max Pairs Configured[/cyan] : Retaining {MAX_PAIRS} verbatim pairs before rolling buffer compression")
+console.print(
+    f"  [cyan]Memory Window[/cyan]        : High-water {MAX_PAIRS} pairs (~{MAX_VERBATIM_TOKENS:,} tokens), batch-evicting {EVICT_BATCH_PAIRS} pairs"
+)
 console.print("  [cyan]/clear[/cyan]               : Flush conversation history & summary buffer")
 console.print("  [cyan]/think[/cyan]               : Toggle Chain-of-Thought reasoning mode (default: OFF)")
 console.print("  [cyan]/think <query>[/cyan]       : Run a single query with Chain-of-Thought reasoning enabled")
@@ -937,7 +1971,7 @@ while True:
             continue
 
         # Terminal Termination Handling
-        if user_input.lower() in ["chat_end", "exit", "quit"]:
+        if user_input.lower() in ["chat_end", "exit", "quit", "/exit", "/quit"]:
             console.print(f"\n[bold yellow][Ending Session][/bold yellow] De-hydrating cache to '{DEFAULT_CACHE_FILE}'...")
             de_hydrate_cache(conversation_history, summary_buffer, DEFAULT_CACHE_FILE)
             save_cmd_history()
@@ -1001,26 +2035,15 @@ while True:
             continue
 
         use_thinking = think_mode or force_think_this_turn
+        is_quant_query = needs_quantitative_reasoning(user_input)
+        effective_thinking = use_thinking or is_quant_query
+        quant_instruction = (
+            "\n- For any mathematical calculations, share allocations, elapsed time ('minutes ago' by subtracting in the same timezone), or physics formulas requested, "
+            "write out each intermediate step and equation explicitly before stating the final result so every number is exact."
+            if is_quant_query
+            else ""
+        )
 
-        # Context-Aware Hybrid Search Classification Step
-        console.print("[dim]Analyzing search intent...[/dim]", end="\r")
-        search_query = determine_search_query(user_input, conversation_history)
-
-        if search_query:
-            console.print(f"[dim]Searching web (max 5) for: '[bold cyan]{search_query}[/bold cyan]'...[/dim]")
-            web_payload = fetch_web_context(search_query, max_results=5)
-            active_user_content = (
-                f"{web_payload}\n"
-                "### INSTRUCTIONS:\n"
-                "Answer the Active User Request below using the web search data above where relevant, "
-                "while maintaining continuity with our recent conversation history.\n\n"
-                f"### ACTIVE USER REQUEST:\n{user_input}"
-            )
-        else:
-            console.print("[dim]Direct response (no web search needed).[/dim]")
-            active_user_content = user_input
-
-        # --- CONSTRUCT VLLM PAYLOAD ARRAY ---
         # 1. Merge Base System Prompt & Summary Buffer into a Single System Message
         if summary_buffer:
             combined_system_content = (
@@ -1030,86 +2053,192 @@ while True:
         else:
             combined_system_content = BASE_SYSTEM_PROMPT
 
-        base_payload = [{"role": "system", "content": combined_system_content}]
+        base_prefix_messages = [{"role": "system", "content": combined_system_content}]
+        base_prefix_messages.extend(conversation_history[1:])
 
-        # 2. Verbatim Recent Pairs
-        base_payload.extend(conversation_history[1:])
+        # 2. Built-in Current Time, Date & World Clock Skill
+        use_clock_skill = is_clock_skill_query(user_input)
+        clock_skill_block = ""
+        if use_clock_skill:
+            clock_status, clock_skill_block = build_live_clock_skill_context(user_input)
+            console.print(f"[dim][Skill: Current Time] [bold cyan]{clock_status}[/bold cyan][/dim]")
 
-        # 3. Active User Turn
-        base_payload.append({"role": "user", "content": active_user_content})
+        # 3. Check Automatic Section-Parallel / Map-Reduce Decomposition (Feature A)
+        parallel_sections = plan_parallel_sections(user_input)
 
-        # 4. Adapt payload & extra_body parameters to the auto-detected MODEL_PROFILE
-        active_payload, extra_body_params = prepare_request_messages_and_extra(
-            base_payload, use_thinking=use_thinking, is_utility_call=False
-        )
-
-        # Echo EXACT vLLM Payload Array if Verbose Mode is Active
-        if verbose_mode or force_verbose_this_turn:
-            full_payload_json = json.dumps(active_payload, indent=2)
-            console.print(
-                Panel(
-                    full_payload_json,
-                    title="[bold yellow]EXACT vLLM Payload Sent to Model[/bold yellow]",
-                    border_style="yellow",
-                    expand=False,
-                )
+        # Prepare direct-turn content (used for direct response or speculative racing)
+        if use_clock_skill:
+            direct_user_content = (
+                f"{clock_skill_block}\n\n"
+                "### INSTRUCTIONS:\n"
+                "Answer the Active User Request below using the exact live current time, date, day of the week, and timezone values "
+                f"from the [SKILL: LIVE SYSTEM CLOCK & CALENDAR] block above. Ignore any older timestamps from earlier conversation turns.{quant_instruction}\n\n"
+                f"### ACTIVE USER REQUEST:\n{user_input}"
+            )
+        else:
+            direct_user_content = (
+                f"{user_input}\n\n[Instruction: Write out each intermediate calculation step explicitly before stating the final result.]"
+                if is_quant_query and not use_thinking
+                else user_input
             )
 
-        console.print("\n[bold green]Assistant:[/bold green]")
+        # 4. Search-by-Default Router (Opt-Out Only for Clock Skill, Pure Code/Math, or Formatting/Recall)
+        if use_clock_skill and not is_external_data_query(user_input):
+            search_query = None
+        else:
+            console.print("[dim]Formulating web search query...[/dim]", end="\r")
+            search_query = determine_search_query(user_input, conversation_history)
 
-        # Performance Metric Counters
-        start_time = time.perf_counter()
-        first_token_time = None
-        full_response = ""
-        completion_tokens = 0
+        if search_query:
+            console.print(f"[dim]Searching web (max 5) for: '[bold cyan]{search_query}[/bold cyan]'...[/dim]")
+            web_payload = fetch_web_context(search_query, max_results=5)
+            skill_prefix = f"{clock_skill_block}\n\n" if clock_skill_block else ""
+            active_user_content = (
+                f"{skill_prefix}{web_payload}\n"
+                "### INSTRUCTIONS:\n"
+                f"Today's date is {CURRENT_DATE_STR}. Your internal pre-training knowledge ended in 2024.\n"
+                "- Use the live 2026 web data whenever it is relevant or updates your 2024 training weights; if the web snippets are unrelated to an abstract/conceptual question, rely on your internal knowledge.\n"
+                "- When the user asks for an exhaustive list or table (e.g., 'List all named moons...', 'List all elements...'), combine the web data with your complete internal knowledge so the table is comprehensive and NEVER restricted to only the few examples mentioned in short web snippets.\n"
+                "- CRITICAL: Chronological tables (such as lists of Presidents, leaders, or champions) list the oldest entries at the top and the MOST RECENT / INCUMBENT entries (2025–2026) at the bottom. Always check the bottom rows (e.g., #47 / 'Incumbent' / 2025–present) and override both your 2024 pre-training memory AND any stale earlier conversation turns with the 2025–2026 facts in the table!\n"
+                "- When asked for the 'last N' or 'most recent N' presidents, leaders, or winners, list them in reverse chronological order starting from the current 2025–2026 incumbent at the bottom of the table (e.g., for last 5 US Presidents: start at #47 Donald Trump [2025–Incumbent], #46 Joe Biden [2021–2025], #45 Donald Trump [2017–2021], #44 Barack Obama [2009–2017], #43 George W. Bush [2001–2009], and #42 Bill Clinton [1993–2001] so both the last 5 presidencies and last 5 distinct individuals are clear)."
+                f"{quant_instruction}\n\n"
+                f"### ACTIVE USER REQUEST:\n{user_input}"
+            )
+        else:
+            if not use_clock_skill:
+                console.print("[dim]Direct response (code/math/formatting opt-out — no web search needed).[/dim]")
+            active_user_content = direct_user_content
 
-        stream_kwargs = {
-            "model": MODEL_NAME,
-            "messages": active_payload,
-            "temperature": 0.6 if use_thinking else 0.7,
-            "max_tokens": MODEL_PROFILE["max_gen_tokens"],
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-        if extra_body_params:
-            stream_kwargs["extra_body"] = extra_body_params
+        # --- EXECUTE GENERATION (AUTO SECTION-PARALLEL OR SINGLE STREAM) ---
+        if parallel_sections:
+            console.print(
+                f"[dim][Auto-Parallel Map-Reduce] Launching [bold cyan]{len(parallel_sections)} simultaneous streams[/bold cyan]: "
+                f"{' | '.join(parallel_sections)}[/dim]"
+            )
+            console.print("\n[bold green]Assistant:[/bold green]")
+            (
+                full_response,
+                ttft_ms,
+                gen_duration,
+                completion_tokens,
+                tps,
+                avg_stream_tps,
+            ) = stream_parallel_sections(
+                base_prefix_messages,
+                active_user_content,
+                parallel_sections,
+                use_thinking=effective_thinking,
+                verbose_flag=(verbose_mode or force_verbose_this_turn),
+            )
+            speedup_x = tps / avg_stream_tps if avg_stream_tps > 0 else float(len(parallel_sections))
+            metrics_summary = (
+                f"[dim]Parallel Streams: [bold cyan]{len(parallel_sections)}[/bold cyan] | "
+                f"TTFT: [bold]{ttft_ms:.1f}ms[/bold] | "
+                f"Gen Time: [bold]{gen_duration:.2f}s[/bold] | "
+                f"Tokens: [bold]{completion_tokens}[/bold] | "
+                f"Effective Speed: [bold cyan]{tps:.1f} t/s[/bold cyan] "
+                f"([bold green]{speedup_x:.1f}x[/bold green] vs {avg_stream_tps:.1f} t/s per stream)[/dim]"
+            )
+            console.print(Panel(metrics_summary, border_style="dim", expand=False))
+            console.print()
+        else:
+            base_payload = list(base_prefix_messages) + [{"role": "user", "content": active_user_content}]
+            active_payload, extra_body_params = prepare_request_messages_and_extra(
+                base_payload, use_thinking=effective_thinking, is_utility_call=False
+            )
 
-        stream = client.chat.completions.create(**stream_kwargs)
+            # Echo EXACT vLLM Payload Array if Verbose Mode is Active
+            if verbose_mode or force_verbose_this_turn:
+                full_payload_json = json.dumps(active_payload, indent=2)
+                console.print(
+                    Panel(
+                        full_payload_json,
+                        title="[bold yellow]EXACT vLLM Payload Sent to Model[/bold yellow]",
+                        border_style="yellow",
+                        expand=False,
+                    )
+                )
 
-        with Live(Markdown(""), console=console, refresh_per_second=15, vertical_overflow="visible") as live:
-            for chunk in stream:
-                if chunk.choices and len(chunk.choices) > 0:
-                    content = chunk.choices[0].delta.content or ""
-                    if content:
-                        if first_token_time is None:
-                            first_token_time = time.perf_counter()
-                        full_response += content
-                        if use_thinking:
-                            live.update(Markdown(format_thinking_markdown(full_response)))
-                        else:
-                            live.update(Markdown(strip_thinking_and_dedup(full_response)))
+            console.print("\n[bold green]Assistant:[/bold green]")
 
-                if hasattr(chunk, "usage") and chunk.usage:
-                    completion_tokens = chunk.usage.completion_tokens
+            full_response = ""
+            completion_tokens = 0
 
-        end_time = time.perf_counter()
+            prog_streamer = ProgressiveMarkdownStreamer(console)
 
-        if completion_tokens == 0 and full_response:
-            completion_tokens = max(1, int(len(full_response) / 4))
+            start_time = time.perf_counter()
+            first_token_time = None
+            stream_kwargs = {
+                "model": MODEL_NAME,
+                "messages": active_payload,
+                "temperature": 0.6 if effective_thinking else 0.7,
+                "max_tokens": MODEL_PROFILE["max_gen_tokens"],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if extra_body_params:
+                stream_kwargs["extra_body"] = extra_body_params
 
-        # Metric Calculations
-        ttft_ms = ((first_token_time or end_time) - start_time) * 1000
-        gen_duration = end_time - (first_token_time or start_time)
-        tps = completion_tokens / gen_duration if gen_duration > 0 else 0.0
+            stream = client.chat.completions.create(**stream_kwargs)
 
-        metrics_summary = (
-            f"[dim]TTFT: [bold]{ttft_ms:.1f}ms[/bold] | "
-            f"Gen Time: [bold]{gen_duration:.2f}s[/bold] | "
-            f"Tokens: [bold]{completion_tokens}[/bold] | "
-            f"Speed: [bold cyan]{tps:.1f} t/s[/bold cyan][/dim]"
-        )
-        console.print(Panel(metrics_summary, border_style="dim", expand=False))
-        console.print()
+            with Live(
+                prog_streamer.make_status_line(""),
+                console=console,
+                refresh_per_second=8,
+                transient=True,
+            ) as live:
+                for chunk in stream:
+                    if chunk.choices and len(chunk.choices) > 0:
+                        content = chunk.choices[0].delta.content or ""
+                        if content:
+                            if first_token_time is None:
+                                first_token_time = time.perf_counter()
+                            full_response += content
+                            if use_thinking:
+                                prog_streamer.step(live, format_thinking_markdown(full_response))
+                            elif (
+                                effective_thinking
+                                and MODEL_PROFILE["mode"] in ("deepseek_qwen3_bridge", "native_think")
+                                and not (DS_THINK_CLOSE_STR in full_response or "</think>" in full_response)
+                            ):
+                                prog_streamer.token_count += 1
+                                live.update(
+                                    prog_streamer.make_status_line(
+                                        prefix_label="⚡ Reasoning",
+                                    )
+                                )
+                            else:
+                                cleaned_live = strip_thinking_and_dedup(full_response)
+                                if cleaned_live:
+                                    prog_streamer.step(live, cleaned_live)
+
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        completion_tokens = chunk.usage.completion_tokens
+
+            final_disp = (
+                format_thinking_markdown(full_response)
+                if use_thinking
+                else strip_thinking_and_dedup(full_response)
+            )
+            prog_streamer.finish(final_disp)
+            end_time = time.perf_counter()
+
+            if completion_tokens == 0 and full_response:
+                completion_tokens = max(1, int(len(full_response) / 4))
+
+            # Metric Calculations
+            ttft_ms = ((first_token_time or end_time) - start_time) * 1000
+            gen_duration = end_time - (first_token_time or start_time)
+            tps = completion_tokens / gen_duration if gen_duration > 0 else 0.0
+
+            metrics_summary = (
+                f"[dim]TTFT: [bold]{ttft_ms:.1f}ms[/bold] | "
+                f"Gen Time: [bold]{gen_duration:.2f}s[/bold] | "
+                f"Tokens: [bold]{completion_tokens}[/bold] | "
+                f"Speed: [bold cyan]{tps:.1f} t/s[/bold cyan][/dim]"
+            )
+            console.print(Panel(metrics_summary, border_style="dim", expand=False))
+            console.print()
 
         # --- RECORD CLEAN HISTORY TURN (WITH CORRUPTION & COT FILTERING) ---
         clean_resp = strip_thinking_and_dedup(full_response)
@@ -1121,20 +2250,27 @@ while True:
         else:
             console.print("[bold red][Warning][/bold red] Discarded low-quality or corrupted assistant turn from history.")
 
-        # --- ROLLING MEMORY COMPRESSION BUFFER ---
+        # --- ROLLING MEMORY COMPRESSION BUFFER (HIGH-WATER / LOW-WATER BATCH EVICTION) ---
         current_pairs = (len(conversation_history) - 1) // 2
+        current_verbatim_tokens = estimate_history_tokens(conversation_history)
 
-        while current_pairs > MAX_PAIRS:
-            old_user_msg = conversation_history.pop(1)
-            old_assistant_msg = conversation_history.pop(1)
+        if current_pairs > MAX_PAIRS or (current_verbatim_tokens > MAX_VERBATIM_TOKENS and current_pairs > 4):
+            target_keep_pairs = max(4, MAX_PAIRS - EVICT_BATCH_PAIRS)
+            evicted_batch: list[tuple[str, str]] = []
+            while current_pairs > target_keep_pairs or (
+                estimate_history_tokens(conversation_history) > (MAX_VERBATIM_TOKENS - 3000) and current_pairs > 4
+            ):
+                old_user_msg = conversation_history.pop(1)
+                old_assistant_msg = conversation_history.pop(1)
+                evicted_batch.append(
+                    (old_user_msg.get("content", ""), old_assistant_msg.get("content", ""))
+                )
+                current_pairs = (len(conversation_history) - 1) // 2
+                if len(evicted_batch) >= EVICT_BATCH_PAIRS and current_pairs <= MAX_PAIRS:
+                    break
 
-            summary_buffer = compress_memory(
-                summary_buffer,
-                old_user_msg.get("content", ""),
-                old_assistant_msg.get("content", ""),
-            )
-
-            current_pairs = (len(conversation_history) - 1) // 2
+            if evicted_batch:
+                summary_buffer = compress_memory_batch(summary_buffer, evicted_batch)
 
         # Silently persist cache and prompt history after each turn
         de_hydrate_cache(conversation_history, summary_buffer, DEFAULT_CACHE_FILE, silent=True)
