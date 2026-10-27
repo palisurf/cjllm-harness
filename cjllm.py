@@ -1632,14 +1632,9 @@ class ProgressiveMarkdownStreamer:
 
         return best_cut
 
-    def make_status_line(self, tail_text: str, prefix_label: str = "⚡ Streaming") -> Text:
-        width = max(40, self.console.size.width - 4)
-        preview = re.sub(r"\s+", " ", tail_text).strip()
-        if len(preview) > width - 28:
-            preview = "…" + preview[-(width - 29) :]
+    def make_status_line(self, tail_text: str = "", prefix_label: str = "⚡ Streaming") -> Text:
         line = Text(no_wrap=True, overflow="ellipsis")
-        line.append(f"{prefix_label} ({self.token_count} tok): ", style="bold cyan")
-        line.append(preview if preview else "...", style="dim")
+        line.append(f"{prefix_label} ({self.token_count} tok)", style="bold cyan")
         return line
 
     def step(self, live: Live, display_text: str, prefix_label: str = "⚡ Streaming"):
@@ -2172,9 +2167,9 @@ while True:
                                 and MODEL_PROFILE["mode"] in ("deepseek_qwen3_bridge", "native_think")
                                 and not (DS_THINK_CLOSE_STR in full_response or "</think>" in full_response)
                             ):
+                                prog_streamer.token_count += 1
                                 live.update(
                                     prog_streamer.make_status_line(
-                                        "Calculating intermediate equations...",
                                         prefix_label="⚡ Reasoning",
                                     )
                                 )
