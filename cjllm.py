@@ -28,6 +28,7 @@ from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.text import Text
 
 # Suppress deprecation warnings from legacy package imports
 warnings.filterwarnings("ignore", category=RuntimeWarning, module="duckduckgo_search")
@@ -1432,6 +1433,134 @@ def plan_parallel_sections(user_input: str) -> list[str] | None:
     ]
 
 
+class ProgressiveMarkdownStreamer:
+    """
+    SSH- & Scrollback-Safe Progressive Markdown Streamer:
+    - Why standard `Live(Markdown(full_response))` jitters and breaks SSH scrollback:
+      Redrawing a multi-line Markdown document 15x/sec sends ANSI cursor-up sequences (`\\x1b[<N>A`).
+      Over SSH, erasing and re-printing dozens of lines causes visible flicker/jitter, and once the
+      response exceeds 1 terminal screen height (~40 lines), cursor-up clamps at row 0 of the viewport,
+      pushing duplicate frames into the terminal scrollback buffer on every token chunk.
+    - How `ProgressiveMarkdownStreamer` solves both:
+      1. The mutable `Live` region is strictly a single non-wrapping 1-line status ticker (`no_wrap=True`,
+         `transient=True`) at the very bottom of the screen, so cursor-up never exceeds 1 line and ZERO
+         duplicate frames ever enter the SSH scrollback buffer.
+      2. As soon as a self-contained Markdown block (heading, paragraph, completed table, completed list,
+         or closed code fence) finishes at a `\\n\\n` boundary, it is permanently printed ONCE above the
+         status ticker via `live.console.print(Markdown(block))` and never redrawn again.
+    """
+
+    def __init__(self, target_console: Console):
+        self.console = target_console
+        self.committed_char_len = 0
+        self.token_count = 0
+
+    @staticmethod
+    def _is_table_line(line: str) -> bool:
+        s = line.strip()
+        return s.startswith("|") or (s.count("|") >= 2 and not s.startswith(("http", "//")))
+
+    @staticmethod
+    def _is_list_line(line: str) -> bool:
+        return bool(
+            re.match(
+                r"^(\s*[-*•+]\s+|\s*\d+[\.\)]\s+|\s+[^\s])",
+                line,
+            )
+        )
+
+    def _find_safe_commit_boundary(self, uncommitted: str) -> int:
+        """
+        Returns the character index `idx` in `uncommitted` up to which complete Markdown blocks
+        can be permanently printed without splitting an in-progress code fence, table, or list.
+        Returns 0 if no complete block boundary is ready yet.
+        """
+        if "\n\n" not in uncommitted:
+            return 0
+
+        search_pos = 0
+        best_cut = 0
+
+        while True:
+            sep_idx = uncommitted.find("\n\n", search_pos)
+            if sep_idx == -1:
+                break
+            after_sep = sep_idx + 2
+            # Require at least 2 non-newline characters after `\n\n` so we can inspect what starts next
+            remainder = uncommitted[after_sep:]
+            remainder_stripped = remainder.lstrip("\n")
+            if len(remainder_stripped) < 2 or "\n" not in remainder_stripped:
+                break
+
+            candidate = uncommitted[:sep_idx]
+            next_first_line = remainder_stripped.split("\n", 1)[0]
+
+            # 1. Never split inside an unclosed ``` code fence
+            if candidate.count("```") % 2 == 1:
+                search_pos = after_sep
+                continue
+
+            # 2. Never split inside an ongoing Markdown table
+            cand_lines = [ln for ln in candidate.splitlines() if ln.strip()]
+            last_line = cand_lines[-1] if cand_lines else ""
+            if self._is_table_line(last_line) and self._is_table_line(next_first_line):
+                search_pos = after_sep
+                continue
+
+            # 3. Never split inside an ongoing bullet/numbered list unless the next block is a heading/rule
+            if (
+                self._is_list_line(last_line)
+                and self._is_list_line(next_first_line)
+                and not next_first_line.lstrip().startswith(("#", "---"))
+            ):
+                search_pos = after_sep
+                continue
+
+            # 4. Never split a standalone heading from its body paragraph
+            if last_line.lstrip().startswith("#"):
+                search_pos = after_sep
+                continue
+
+            best_cut = after_sep
+            search_pos = after_sep
+
+        return best_cut
+
+    def make_status_line(self, tail_text: str, prefix_label: str = "⚡ Streaming") -> Text:
+        width = max(40, self.console.size.width - 4)
+        preview = re.sub(r"\s+", " ", tail_text).strip()
+        if len(preview) > width - 28:
+            preview = "…" + preview[-(width - 29) :]
+        line = Text(no_wrap=True, overflow="ellipsis")
+        line.append(f"{prefix_label} ({self.token_count} tok): ", style="bold cyan")
+        line.append(preview if preview else "...", style="dim")
+        return line
+
+    def step(self, live: Live, display_text: str, prefix_label: str = "⚡ Streaming"):
+        self.token_count += 1
+        if len(display_text) < self.committed_char_len:
+            self.committed_char_len = 0
+
+        uncommitted = display_text[self.committed_char_len :]
+        cut = self._find_safe_commit_boundary(uncommitted)
+        if cut > 0:
+            block_to_commit = uncommitted[:cut].strip()
+            if block_to_commit:
+                live.console.print(Markdown(block_to_commit))
+                live.console.print()
+            self.committed_char_len += cut
+            uncommitted = display_text[self.committed_char_len :]
+
+        live.update(self.make_status_line(uncommitted, prefix_label=prefix_label))
+
+    def finish(self, display_text: str):
+        if len(display_text) < self.committed_char_len:
+            self.committed_char_len = 0
+        remainder = display_text[self.committed_char_len :].strip()
+        if remainder:
+            self.console.print(Markdown(remainder))
+
+
 def stream_parallel_sections(
     base_prefix_messages: list[dict],
     shared_active_user_content: str,
@@ -1440,10 +1569,11 @@ def stream_parallel_sections(
     verbose_flag: bool = False,
 ) -> tuple[str, float, float, int, float, float]:
     """
-    Feature A — Section-Parallel / Map-Reduce Executor:
-    Launches N simultaneous streaming requests (1 per section). All N streams share the exact same
-    `base_prefix_messages` and `shared_active_user_content` prefix so vLLM prefix-caches 99% of the
-    prompt across all N slots, then decodes all N sections in lockstep inside a single hardware batch.
+    Feature A — Section-Parallel / Map-Reduce Executor (Scrollback-Safe):
+    Launches N simultaneous streaming requests (1 per section). While all N streams decode in parallel,
+    displays a single-line non-wrapping status bar (`transient=True`) so zero jitter or scrollback
+    corruption occurs over SSH, then prints each completed section permanently in order (1..N) as soon
+    as it is ready!
     Returns (combined_response, ttft_ms, gen_duration, total_tokens, effective_tps, avg_stream_tps).
     """
     n_streams = len(sections)
@@ -1452,6 +1582,7 @@ def stream_parallel_sections(
     section_first_t: list[float | None] = [None for _ in range(n_streams)]
     section_end_t: list[float | None] = [None for _ in range(n_streams)]
     section_done = [False for _ in range(n_streams)]
+    section_printed = [False for _ in range(n_streams)]
     lock = threading.Lock()
     start_time = time.perf_counter()
 
@@ -1515,20 +1646,29 @@ def stream_parallel_sections(
                     section_tokens[idx] = max(1, len(section_buffers[idx]) // 4)
                 section_done[idx] = True
 
-    def _render_parallel_markdown() -> str:
-        parts = []
+    def _format_single_section(idx: int) -> str:
+        title = sections[idx]
+        cleaned_sec = strip_thinking_and_dedup(section_buffers[idx])
+        if cleaned_sec:
+            if not cleaned_sec.lstrip().startswith("#"):
+                cleaned_sec = f"### {idx + 1}. {title}\n{cleaned_sec}"
+            return cleaned_sec
+        return f"### {idx + 1}. {title}\n*(No content)*"
+
+    def _make_parallel_status_line() -> Text:
         with lock:
-            for i, title in enumerate(sections):
-                raw_sec = section_buffers[i]
-                cleaned_sec = strip_thinking_and_dedup(raw_sec)
-                status_badge = "✓" if section_done[i] else "⚡ streaming..."
-                if cleaned_sec:
-                    if not cleaned_sec.lstrip().startswith("#"):
-                        cleaned_sec = f"### {i + 1}. {title}\n{cleaned_sec}"
-                    parts.append(cleaned_sec)
-                else:
-                    parts.append(f"### {i + 1}. {title}\n*({status_badge})*")
-        return "\n\n---\n\n".join(parts)
+            badges = []
+            total_chars = 0
+            for i in range(n_streams):
+                n_tok_est = section_tokens[i] or (len(section_buffers[i]) // 4)
+                total_chars += len(section_buffers[i])
+                state = "✓" if section_done[i] else f"{n_tok_est}t"
+                badges.append(f"S{i + 1}:{state}")
+            status_str = " ".join(badges)
+        line = Text(no_wrap=True, overflow="ellipsis")
+        line.append(f"⚡ Parallel Map-Reduce ({n_streams} streams | ~{total_chars // 4} tok): ", style="bold cyan")
+        line.append(status_str, style="dim")
+        return line
 
     threads = [
         threading.Thread(target=_run_section_stream, args=(i, sec_title), daemon=True)
@@ -1537,11 +1677,36 @@ def stream_parallel_sections(
     for t in threads:
         t.start()
 
-    with Live(Markdown(""), console=console, refresh_per_second=15, vertical_overflow="visible") as live:
+    next_to_print = 0
+    with Live(
+        _make_parallel_status_line(),
+        console=console,
+        refresh_per_second=8,
+        transient=True,
+    ) as live:
         while not all(section_done):
-            live.update(Markdown(_render_parallel_markdown()))
-            time.sleep(0.06)
-        live.update(Markdown(_render_parallel_markdown()))
+            # Permanently print completed sections in sequential order (0, 1, 2, ...) as soon as each finishes!
+            while next_to_print < n_streams and section_done[next_to_print]:
+                with lock:
+                    sec_md = _format_single_section(next_to_print)
+                    section_printed[next_to_print] = True
+                if next_to_print > 0:
+                    live.console.print(Markdown("---"))
+                live.console.print(Markdown(sec_md))
+                live.console.print()
+                next_to_print += 1
+            live.update(_make_parallel_status_line())
+            time.sleep(0.08)
+
+        while next_to_print < n_streams:
+            with lock:
+                sec_md = _format_single_section(next_to_print)
+                section_printed[next_to_print] = True
+            if next_to_print > 0:
+                live.console.print(Markdown("---"))
+            live.console.print(Markdown(sec_md))
+            live.console.print()
+            next_to_print += 1
 
     for t in threads:
         t.join(timeout=1.0)
@@ -1560,13 +1725,7 @@ def stream_parallel_sections(
             per_stream_rates.append(section_tokens[i] / (section_end_t[i] - section_first_t[i]))
     avg_stream_tps = sum(per_stream_rates) / len(per_stream_rates) if per_stream_rates else (effective_tps / n_streams)
 
-    final_parts = []
-    for i, title in enumerate(sections):
-        cleaned_sec = strip_thinking_and_dedup(section_buffers[i])
-        if cleaned_sec:
-            if not cleaned_sec.lstrip().startswith("#"):
-                cleaned_sec = f"### {i + 1}. {title}\n{cleaned_sec}"
-            final_parts.append(cleaned_sec)
+    final_parts = [_format_single_section(i) for i in range(n_streams)]
     combined_response = "\n\n---\n\n".join(final_parts)
     return combined_response, ttft_ms, gen_duration, total_tokens, effective_tps, avg_stream_tps
 
@@ -1854,11 +2013,18 @@ while True:
             full_response = ""
             completion_tokens = 0
 
+            prog_streamer = ProgressiveMarkdownStreamer(console)
+
             if spec_queue is not None and spec_meta is not None:
                 # Consume the already-running speculative direct stream
                 start_time = spec_meta["start_time"]
                 first_token_time = spec_meta["first_token_time"]
-                with Live(Markdown(""), console=console, refresh_per_second=15, vertical_overflow="visible") as live:
+                with Live(
+                    prog_streamer.make_status_line(""),
+                    console=console,
+                    refresh_per_second=8,
+                    transient=True,
+                ) as live:
                     while True:
                         msg_type, item = spec_queue.get()
                         if msg_type == "done":
@@ -1873,15 +2039,26 @@ while True:
                                     first_token_time = spec_meta["first_token_time"] or time.perf_counter()
                                 full_response += content
                                 if use_thinking:
-                                    live.update(Markdown(format_thinking_markdown(full_response)))
+                                    prog_streamer.step(live, format_thinking_markdown(full_response))
                                 else:
                                     cleaned_live = strip_thinking_and_dedup(full_response)
                                     if cleaned_live:
-                                        live.update(Markdown(cleaned_live))
+                                        prog_streamer.step(live, cleaned_live)
                                     elif is_quant_query:
-                                        live.update(Markdown("*Calculating step-by-step...*"))
+                                        live.update(
+                                            prog_streamer.make_status_line(
+                                                "Calculating intermediate equations...",
+                                                prefix_label="⚡ Reasoning",
+                                            )
+                                        )
                         if hasattr(chunk, "usage") and chunk.usage:
                             completion_tokens = chunk.usage.completion_tokens
+                final_disp = (
+                    format_thinking_markdown(full_response)
+                    if use_thinking
+                    else strip_thinking_and_dedup(full_response)
+                )
+                prog_streamer.finish(final_disp)
                 end_time = time.perf_counter()
             else:
                 start_time = time.perf_counter()
@@ -1899,7 +2076,12 @@ while True:
 
                 stream = client.chat.completions.create(**stream_kwargs)
 
-                with Live(Markdown(""), console=console, refresh_per_second=15, vertical_overflow="visible") as live:
+                with Live(
+                    prog_streamer.make_status_line(""),
+                    console=console,
+                    refresh_per_second=8,
+                    transient=True,
+                ) as live:
                     for chunk in stream:
                         if chunk.choices and len(chunk.choices) > 0:
                             content = chunk.choices[0].delta.content or ""
@@ -1908,17 +2090,28 @@ while True:
                                     first_token_time = time.perf_counter()
                                 full_response += content
                                 if use_thinking:
-                                    live.update(Markdown(format_thinking_markdown(full_response)))
+                                    prog_streamer.step(live, format_thinking_markdown(full_response))
                                 else:
                                     cleaned_live = strip_thinking_and_dedup(full_response)
                                     if cleaned_live:
-                                        live.update(Markdown(cleaned_live))
+                                        prog_streamer.step(live, cleaned_live)
                                     elif is_quant_query:
-                                        live.update(Markdown("*Calculating step-by-step...*"))
+                                        live.update(
+                                            prog_streamer.make_status_line(
+                                                "Calculating intermediate equations...",
+                                                prefix_label="⚡ Reasoning",
+                                            )
+                                        )
 
                         if hasattr(chunk, "usage") and chunk.usage:
                             completion_tokens = chunk.usage.completion_tokens
 
+                final_disp = (
+                    format_thinking_markdown(full_response)
+                    if use_thinking
+                    else strip_thinking_and_dedup(full_response)
+                )
+                prog_streamer.finish(final_disp)
                 end_time = time.perf_counter()
 
             if completion_tokens == 0 and full_response:
