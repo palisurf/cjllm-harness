@@ -18,10 +18,10 @@ Running frontier open-weight LLMs locally on dedicated hardware (`vLLM` on Tenst
 ### Intent of `cjllm-search-harness`
 `cjllm-search-harness` was created to solve all three problems in **a single, self-contained Python script ([`cjllm.py`](./cjllm.py))** with zero external server dependencies, zero paid search API keys, and identical behavior across **Tenstorrent QuietBox 2** and **NVIDIA DGX Spark**:
 
-* **Drop-in Terminal Ergonomics:** Runs immediately over SSH or locally (`./run_chat`) with full GNU `readline` history, live Markdown streaming, and instant slash commands (`/think`, `/v`, `/save`, `/load`, `/clear`).
+* **Drop-in, Jitter-Free SSH Terminal Ergonomics:** Runs immediately over SSH or locally (`./run_chat`) with full GNU `readline` history, a **50-line hybrid transient Markdown streamer (`_BoundedMarkdownView` + `ProgressiveMarkdownStreamer`)** that commits completed Markdown blocks once into permanent scrollback (zero screen jitter, infinite scrollback), and instant slash commands (`/think`, `/v`, `/save`, `/load`, `/clear`).
 * **Runtime Model & Tokenizer Auto-Adaptation:** Probes `/v1/models` and token behavior at startup (~100ms) to automatically configure stop tokens and reasoning prefills for `DeepSeek-R1-Distill` (`deepseek_qwen3_bridge`), native reasoning models (`native_think`), or standard instruct models (`standard_instruct`).
-* **Deep, Keyless Web & Table Grounding:** Combines a fast LLM search-intent router with a 4-tier scraper that pulls live Yahoo Finance multi-index quote cards, 7-day weather forecasts, up to 6 structured HTML `<table>` blocks per page, and direct NOAA NDBC station telemetry (`ndbc.noaa.gov`) alongside organic and news search results.
-* **Built-In Hardware Telemetry:** Every response reports real-time **Time-To-First-Token (`TTFT ms`)**, **Generation Time (`s`)**, **Output Tokens**, and **Decode Throughput (`t/s`)**, making it both a daily assistant and an interactive hardware benchmark harness.
+* **Search-by-Default Grounding & Head+Tail HTML `<table>` Extraction:** Eliminates post-2024 training-cutoff blindness by querying the web by default on every informational prompt (opting out only for clock skill, pure coding/math, or formatting prior turns) and running a 4-tier scraper that pulls Yahoo Finance multi-ticker/macro cards, 7-day weather forecasts, head+tail rows of structured HTML `<table>` blocks, and direct NOAA NDBC buoy telemetry (`ndbc.noaa.gov`).
+* **Automatic Multi-Slot Section-Parallel Map-Reduce & Hardware Telemetry:** Automatically decomposes multi-part, multi-entity, and exhaustive table prompts into **2–5 simultaneous `vLLM` streams** (`2.8×–4.2×` effective throughput speedup) and reports real-time **Time-To-First-Token (`TTFT ms`)**, **Generation Time (`s`)**, **Output Tokens**, and **Decode Throughput (`t/s`)** on every turn.
 
 ---
 
@@ -34,8 +34,10 @@ Running frontier open-weight LLMs locally on dedicated hardware (`vLLM` on Tenst
 | **Fast `OFF` Mode for Reasoning Models** | **Yes** (Closed micro-thought prefill skips CoT & cuts latency ~50%; toggle `/think` anytime) | No (always runs full CoT monologue) | Limited (`--think` on supported tags only) | Displays CoT, rarely suppresses generation | No |
 | **Live Search Without Paid API Keys** | **Yes** (Keyless `ddgs` + `primp` browser-impersonated scraping) | None | None built-in | Basic snippet search or paid APIs | Requires local SearXNG container |
 | **Live Financial & Multi-Index Quotes** | **Yes** (Auto-expands `Dow`, `S&P 500`, `Nasdaq` & ticker quote cards) | None | None | Meta-description blurbs only | Meta-description blurbs only |
-| **Structured HTML `<table>` & NOAA Buoy Extraction** | **Yes** (Extracts up to 6 HTML tables/page + auto-resolves 5-digit NOAA NDBC buoy IDs) | None | None | Full-page text dump (loses table structure) | Text chunks only |
-| **Context-Aware Search Router** | **Yes** (Resolves pronouns & follow-up narrowing like *"for today only instead"*) | None | None | Basic query rewrite | Yes (higher latency multi-agent chain) |
+| **Structured HTML `<table>` & NOAA Buoy Extraction** | **Yes** (Head+tail row extraction across up to 8 tables/page + auto-resolves 5-digit NOAA NDBC buoy IDs) | None | None | Full-page text dump (loses table structure) | Text chunks only |
+| **Search-by-Default Context Router** | **Yes** (Searches by default to prevent post-2024 cutoff hallucinations; opts out only for clock/code/math/formatting) | None | None | Manual toggle or basic query rewrite | Yes (higher latency multi-agent chain) |
+| **Automatic Multi-Slot Parallel Generation** | **Yes** (Auto-decomposes multi-part / multi-entity / large table prompts into 2–5 simultaneous streams) | Single stream | Single stream | Single stream | Single stream |
+| **SSH Scrollback-Safe Live Streaming** | **Yes** (50-line transient Markdown preview + once-only block commits to permanent scrollback) | Raw text stdout | Raw text stdout | Browser DOM | Browser DOM |
 | **Memory Management** | **30-pair (`~20K` token) verbatim window + 8-pair batch eviction into numerical summary buffer (KV prefix-cache friendly)** | Manual / unbounded | Simple context truncation | Full history / vector RAG | Per-thread history |
 | **Crash-Safe Session Persistence** | **Yes** (Auto-saves `chat_cache.json` & `.chat_prompt_history` after every turn) | None | None | Database-backed | Database-backed |
 | **Per-Turn Hardware Telemetry** | **Yes** (`TTFT ms`, `Gen Time s`, `Tokens`, `Speed t/s`, `/v` payload inspector) | None | `--verbose` summary at exit | Basic token speed | None |
@@ -44,43 +46,59 @@ Running frontier open-weight LLMs locally on dedicated hardware (`vLLM` on Tenst
 
 ## 3. Current Capabilities & Architecture
 
+### Concise Feature Summary (`v6b068d8`)
+
+| Subsystem | Key Functions in [`cjllm.py`](./cjllm.py) | Summary of Capability |
+| :--- | :--- | :--- |
+| **1. Model & Tokenizer Bridge** | `detect_model_profile`, `prepare_request_messages_and_extra`, `strip_thinking_and_dedup` | Auto-detects `deepseek_qwen3_bridge` (`<\|box_start\|>`/`<\|box_end\|>`), `native_think` (`<think>`/`</think>`), or `standard_instruct`. Suppresses CoT by default (`think_mode=OFF`) via completed micro-thought prefill (~50% lower latency); toggle CoT anytime with `/think`. |
+| **2. Built-In Current Time & World Clock Skill** | `resolve_local_timezone`, `is_clock_skill_query`, `build_live_clock_skill_context`, `get_dual_clock_str` | Injects live local (`PDT`/`PST`, guarding against headless `Etc/UTC` hosts) and `UTC/GMT` clocks (12h + 24h) plus world timezone conversions into `messages[-1]` without mutating `messages[0]` (preserving KV prefix cache). |
+| **3. Search-by-Default Query Formulator** | `is_search_opt_out_query`, `determine_search_query`, `_build_fallback_search_query` | Eliminates 2024 pre-training cutoff blindness by querying the web **by default** on all factual/informational prompts (resolving 3-turn pronouns & 5-digit buoy IDs), opting out **only** for clock skill, pure code/math/formulas, or formatting/recall commands on prior turns. |
+| **4. 4-Tier Web, Finance, Weather & Head+Tail Table Scraper** | `fetch_web_context`, `fetch_yahoo_rich_cards`, `fetch_top_page_table_or_excerpt` | Pulls parallel Yahoo Finance multi-ticker/index/macro cards, multi-city 7-day weather forecasts, direct NOAA NDBC buoy pages, and up to 3 structured HTML `<table>` blocks (preserving both top `[:8]` and bottom `[-12:]` chronological rows while stripping MediaWiki `data-mw` & `navbox` noise). |
+| **5. Quantitative Auto-Think Escalation** | `needs_quantitative_reasoning` | Automatically enables internal `<\|box_start\|>` reasoning and step-by-step intermediate equations on portfolio math, timezone deltas, and physics formulas even when `/think` is `OFF` (while excluding pure code generation). |
+| **6. 30-Pair Verbatim Window & 8-Pair Batch Archivist** | `compress_memory_batch`, `estimate_history_tokens` | Retains up to `30` verbatim turn pairs (`~20,000` tokens) and batch-evicts the oldest `8` pairs in one archivist call into `summary_buffer`, keeping `messages[0]` byte-identical for 8 turns at a time (**12/12 `100%` multi-needle recall at `~18.6K` tokens**). |
+| **7. Automatic Section-Parallel Map-Reduce Generation** | `detect_auto_parallel_sections`, `plan_parallel_sections`, `stream_parallel_sections` | Automatically decomposes multi-part (`1) 2)`), multi-ticker ($\ge 2$), multi-entity (`X and Y`), deep-dive, and exhaustive table (`"List all..."`) prompts into **2–5 simultaneous `vLLM` streams** (`2.8×–4.2×` effective throughput speedup). |
+| **8. 50-Line Hybrid Transient Streamer & Scrollback Commit** | `_BoundedMarkdownView`, `ProgressiveMarkdownStreamer` | Streams up to `50` lines (clamped to `console.size.height - 2`) of live formatted Markdown above a 1-line token counter (`⚡ Streaming (N tok)`), then switches on completion to **Once-Only Progressive Markdown Block Commits** for jitter-free, infinite SSH scrollback. |
+
 ```
 User Input
    │
-   ├──► Slash Command Handler (/think, /v, /clear, /save, /load, chat_end)
+   ├──► Slash Command Handler (/think, /v, /clear, /save, /load, chat_end, /exit)
    │
    ▼
-1. Search Intent Classifier (`determine_search_query`)
-   • Injects current system weekday & date (prevents training-cutoff year hallucinations)
-   • Passes recent conversation turns to resolve pronouns ("they", "it") and follow-ups ("today only")
-   • Uses non-thinking fast prefill (30-token budget → "NONE" or concise 2–12 word search query)
-   • Strips preamble labels and rejects leaked reasoning sentences before hitting search engines
+1. Built-In Current Time Skill (`is_clock_skill_query`) & Parallel Planner (`plan_parallel_sections`)
+   • Injects live `[SKILL: LIVE SYSTEM CLOCK & CALENDAR]` block when time/date/weekday is requested
+   • Checks if prompt decomposes into 2–5 parallel sections (multi-entity, exhaustive table, or deep-dive)
    │
-   ├──► [If Search Needed] Multi-Tier Web Context Builder (`fetch_web_context`)
-   │       ├─ Tier 1: Yahoo Search Rich Quote, Multi-Index (`^DJI`, `^GSPC`, `^IXIC`), Weather & Fact Cards
-   │       ├─ Tier 2: Multi-Table HTML `<table>` Extractor (up to 6 tables/page + NOAA NDBC station resolver)
+   ▼
+2. Search-by-Default Query Formulator (`determine_search_query` + `is_search_opt_out_query`)
+   • Opts out ONLY for: (1) Clock Skill, (2) Pure Coding/Math/Formulas, (3) Formatting/Recalling prior turns
+   • For all other prompts: formulates a 2–10 word search query using 3-turn context & 2026 date grounding
+   • Overrides any mistaken 'NONE' or declarative prose via `_build_fallback_search_query`
+   │
+   ├──► [Search Active] 4-Tier Web Context Builder (`fetch_web_context`)
+   │       ├─ Tier 1: Parallel Yahoo Finance Quote, Multi-Index (`^DJI`, `^GSPC`, `^IXIC`), Macro & Weather Cards
+   │       ├─ Tier 2: Head+Tail HTML `<table>` Extractor (skips navboxes, keeps `[:8]` + `[-12:]` rows + NOAA buoys)
    │       ├─ Tier 3: Cleaned Organic Web Snippets (`DDGS().text()`)
    │       └─ Tier 4: Recent News Articles (`DDGS().news()`)
    │
    ▼
-2. Payload Construction & Model-Profile Adaptation (`prepare_request_messages_and_extra`)
+3. Payload Construction & Model-Profile Adaptation (`prepare_request_messages_and_extra`)
    • Single merged system prompt (`BASE_SYSTEM_PROMPT` + `summary_buffer`)
    • Verbatim sliding window (`MAX_PAIRS = 30` pairs / `~20,000` tokens high-water mark, batch-evicting `8` pairs)
-   • Active user turn (with injected live web data and anti-hallucination guardrails)
+   • Active user turn (with 2026 web data + chronological table & exhaustive-list synthesis rules)
    • Automatic tokenizer prefill & stop-token adaptation based on `MODEL_PROFILE`
    │
    ▼
-3. Streaming Generation & Live Telemetry
-   • Streams Markdown via `rich.live.Live`
-   • Default `think_mode = OFF`: suppresses CoT via completed micro-thought prefill + live stream sanitizer
-   • Optional `/think` (`ON`): streams Chain-of-Thought inside a formatted quote block separated from the answer
-   • Computes and displays `TTFT (ms)`, `Gen Time (s)`, `Tokens`, and `Speed (t/s)`
+4. Execution: Single Stream OR Automatic 2–5 Stream Parallel Map-Reduce (`stream_parallel_sections`)
+   • 50-line hybrid transient Markdown view (`_BoundedMarkdownView`) + 1-line token-count-only status footer
+   • Upon completion: switches to Once-Only Progressive Markdown Block Commits (`ProgressiveMarkdownStreamer.finish`)
+   • Computes and displays `TTFT (ms)`, `Gen Time (s)`, `Tokens`, and `Speed (t/s)` (plus parallel speedup `×`)
    │
    ▼
-4. Sanitization, Rolling Memory Compression & Auto-Save
+5. Sanitization, Rolling Batch Memory Compression & Crash-Safe Auto-Save
    • Strips CoT blocks and residual special tokens (`strip_thinking_and_dedup`)
    • Quality gate discards degenerate/corrupted responses before they pollute history
-   • Evicts oldest turn pairs beyond `MAX_PAIRS` into `summary_buffer` (`compress_memory`)
+   • Batch-evicts 8 oldest turn pairs when exceeding `MAX_PAIRS = 30` (`compress_memory_batch`)
    • Auto-saves `chat_cache.json` and `.chat_prompt_history` after every completed turn
 ```
 
@@ -102,21 +120,26 @@ At startup, the harness queries `/v1/models` to auto-discover the active model I
 2. **`native_think`:** Engaged when the model uses literal `<think>` / `</think>` tokens (native `DeepSeek-R1`, `Qwen3`, `QwQ`).
 3. **`standard_instruct`:** Engaged for non-reasoning instruct models (`Llama-3.1-70B-Instruct`, `Llama-3.1-8B-Instruct`, `Mistral`, `Gemma`). Sends standard chat completion payloads while still supporting `/think` via prompt-guided `<think>...</think>` tags.
 
-#### C. Built-In Current Time, Date & World Clock Skill (`build_live_clock_skill_context`) + Context-Aware Search Router (`determine_search_query`)
+#### C. Built-In Current Time, Date & World Clock Skill (`build_live_clock_skill_context`) + Search-by-Default Router (`determine_search_query`)
 * **Built-In Current Time, Calendar & World Clock Skill (`is_clock_skill_query` / `build_live_clock_skill_context`):**
   * Automatically resolves the user's local IANA timezone (`--tz` or `CJLLM_TZ`, defaulting to `America/Los_Angeles` `PDT`/`PST` when running on headless `Etc/UTC` Linux servers/containers so evening queries after 5:00 PM Pacific never roll forward into tomorrow's UTC date).
   * Intercepts queries asking for the current time, date, day of the week (*"What time is it now"*, *"What day of the week is tomorrow"*), or world timezones (*"What time is it in Tokyo and London right now?"*) and injects an authoritative `[SKILL: LIVE SYSTEM CLOCK & CALENDAR]` block into the active turn (`messages[-1]`) down to the second—without mutating `messages[0]` (preserving 100% KV prefix-cache hit rates) and overriding any older timestamps in conversation history.
-* **Dual Local & UTC/GMT Clock Grounding (`get_dual_clock_str`):** Injects both the local system clock (`PDT/PST`) and the current `UTC/GMT` clock (in both 12-hour and 24-hour formats) into the search classifier and web context header so UTC-stamped marine/aviation reports (like NOAA buoys crossing UTC midnight) are always converted and subtracted accurately.
+* **Dual Local & UTC/GMT Clock Grounding (`get_dual_clock_str`):** Injects both the local system clock (`PDT/PST`) and the current `UTC/GMT` clock (in both 12-hour and 24-hour formats) into the search query formulator and web context header so UTC-stamped marine/aviation reports (like NOAA buoys crossing UTC midnight) are always converted and subtracted accurately.
+* **Search-by-Default Philosophy (`is_search_opt_out_query` & `_build_fallback_search_query`):**
+  * Because a model with a 2024 pre-training cutoff does not know which world facts changed between 2024 and 2026 (elections, CEOs, mergers, laws, hardware releases), [`determine_search_query`](./cjllm.py) operates in **Search-by-Default** mode: it **always** generates a search query and fetches live web context unless [`is_search_opt_out_query`](./cjllm.py) detects that the prompt is strictly:
+    1. Built-in clock/calendar skill,
+    2. Pure coding, math, algebra, or physics formula evaluation, or
+    3. A formatting, sorting, conversion, or memory-recall command on previous conversation turns (*"sort that table"*, *"make it shorter"*, *"convert to JSON"*, *"summarize our conversation so far"*).
+  * If the LLM router ever outputs `NONE` or declarative prose on a non-opt-out prompt, [`_build_fallback_search_query`](./cjllm.py) overrides it with a clean keyword query so 2024 pre-training confidence can never suppress live verification.
 * **3-Turn Multi-Hop & Entity Resolution:** Inspects up to 3 conversation turn pairs (`600` chars/turn) and automatically indexes 5-digit NOAA buoy station IDs and location clauses from recent history so multi-hop follow-ups (*"Pull the readings for that buoy"*, *"the second one"*, *"for today only instead"*) preserve the exact station ID or ticker.
-* **Pure Code/Math False-Positive Guard & Reasoning-Leak Filter:** Deterministically skips web searches on pure coding, circuit physics, and calculus prompts containing words like *"current"* or *"today"*, while stripping `"Search Query:"` labels and rejecting >12-word reasoning sentences.
 
-#### D. 4-Tier Live Web, Market, Weather, Surf & Buoy Extractor (`fetch_web_context`)
+#### D. 4-Tier Live Web, Market, Weather, Surf & Head+Tail Table Extractor (`fetch_web_context`)
 1. **Live Market, Multi-Ticker, Macro-Asset, Multi-City Weather & Fact Cards (`fetch_yahoo_rich_cards`):**
    * **Stock, Multi-Index & Macro Quotes:** Automatically expands queries mentioning multiple US indices (`^DJI`, `^GSPC`, `^IXIC`, `^RUT`), macro assets (`Bitcoin`, `Ethereum`, `Gold`, `10-Year Treasury Yield`), or multiple individual stock tickers (*"Compare NVDA, AAPL, and AMD today"*) into parallel live Yahoo Finance quote card lookups.
    * **Multi-City Current Weather & 7-Day Forecast:** Automatically splits multi-location weather comparisons (*"Compare weather in Malibu, CA vs. Honolulu, HI"*) so each city gets its own live current conditions and 7-day forecast card.
    * **Structured Entity Fact Tables:** Extracts embedded financial and company metrics.
-2. **Two-Pass Multi-Table HTML `<table>` & NOAA Buoy Scraper (`fetch_top_page_table_or_excerpt`):**
-   * **Pass 1 (Tabular Priority):** Scans up to 4 candidate URLs across prioritized tabular domains (`ndbc.noaa.gov`, `weather.gov`, `swellinfo.com`, `deepswell.com`, `surf-forecast.com`, `tideschart.com`, `companiesmarketcap.com`, `stockanalysis.com`, `wikipedia.org`, `slickcharts.com`, `finance.yahoo.com`) and extracts up to **6 HTML `<table>` blocks per page**, ensuring a non-tabular rank-1 article never shadows a real table at rank 2–4.
+2. **Two-Pass Head+Tail HTML `<table>` & NOAA Buoy Scraper (`fetch_top_page_table_or_excerpt`):**
+   * **Pass 1 (Tabular Priority with Head+Tail Row Preservation):** Scans up to 4 candidate URLs across prioritized tabular domains (`ndbc.noaa.gov`, `weather.gov`, `swellinfo.com`, `deepswell.com`, `surf-forecast.com`, `tideschart.com`, `companiesmarketcap.com`, `stockanalysis.com`, `wikipedia.org`, `slickcharts.com`, `finance.yahoo.com`), strips MediaWiki `data-mw` JSON attributes and `<sup>` footnote tags, skips footer/sidebar `<table class="navbox|ambox|mbox|metadata|toc">` elements, and extracts **both the top rows (`[:8]`) and bottom rows (`[-12:]`)** across up to 3 distinct table blocks (`4,500` chars)—ensuring long chronological tables (such as US Presidents `#1–#47`) always retain the 2025–2026 incumbent rows at the bottom.
    * **Automatic NOAA Buoy Resolution:** Detects 5-digit **NOAA NDBC buoy station IDs** (`46221`, `46054`, `46025`, etc.) in either the search query or snippets and directly fetches `https://www.ndbc.noaa.gov/station_page.php?station=<ID>`.
    * **Pass 2 (Plain-Text Fallback):** Falls back to a cleaned webpage excerpt only when no candidate URL contains a valid HTML `<table>`.
 3. **Filtered Organic Snippets (`DDGS().text()`):** Up to 5 cleaned organic web snippets.
@@ -145,12 +168,20 @@ To verify that extending the verbatim window to `MAX_PAIRS = 30` (`~18.6K` token
 
 * **Total Multi-Needle Recall Score:** **`12 / 12 (100.0%)`** across all conversation depths (`7%` through `97%`) with zero attention dilution.
 
-#### G. Automatic Multi-Slot Concurrency Acceleration (Section-Parallel Map-Reduce Generation)
+#### G. Automatic Multi-Slot Concurrency Acceleration (Section-Parallel Map-Reduce Generation) & 50-Line Hybrid SSH Streamer
 Because LLM decode on both **Tenstorrent QuietBox 2 (`P300X2`, 32 slots)** and **NVIDIA DGX Spark (`GB10`, 128+ slots)** is memory-bandwidth bound at `batch = 1`, `vLLM` continuous batching can decode multiple concurrent streams in a single forward pass by reading the 32B model weights from memory once per step. [`cjllm.py`](./cjllm.py) exploits those parallel slots **100% automatically with zero slash commands**:
 
-* **Automatic Section-Parallel / Map-Reduce Generation (`plan_parallel_sections` + `stream_parallel_sections`):**
-  * Automatically detects when a prompt naturally decomposes into 3–5 independent parallel sections (such as `1) ... 2) ... 3) ...` numbered sub-tasks, comparing $\ge 3$ stock tickers like *"Compare NVDA, AAPL, and AMD today"*, comma-separated multi-topic explanations like *"Explain NoC routing, Paged KV caching, RoPE embeddings, and SwiGLU activations"*, or comprehensive deep-dive requests).
-  * Runs **after** live web search retrieval so every parallel slot receives the full 2026 web-grounded context, launches **all $N$ section streams simultaneously** with a 99%-identical prompt prefix (maximizing `vLLM` KV prefix caching across all $N$ slots), and progressively commits completed sections to the terminal scrollback buffer, achieving **`3.5×` to `4.2×` higher single-user throughput (`~58–75+ tok/s`)**.
+* **Automatic Section-Parallel / Map-Reduce Generation (`detect_auto_parallel_sections` + `plan_parallel_sections` + `stream_parallel_sections`):**
+  * Automatically detects when a prompt naturally decomposes into **2–5 independent parallel sections**, including:
+    1. Explicit numbered sub-tasks (`1) ... 2) ...`),
+    2. Multi-ticker / multi-company comparisons ($\ge 2$ tickers, e.g. *"Compare NVDA, AAPL, and AMD today"*),
+    3. Comma-separated multi-topic explanations/lists (*"Explain NoC routing, Paged KV caching, RoPE embeddings, and SwiGLU activations"*),
+    4. Multi-entity table/comparison requests (`X and Y` / `X vs Y`), and
+    5. Exhaustive `"List all..."` table requests (*"List all of the named moons of Saturn and Jupiter, in a table"*, which automatically splits large 2-category enumerations into **4 parallel sub-table streams** with up to `1,400` tokens/stream).
+  * Runs **after** live web search retrieval so every parallel slot receives the full 2026 web-grounded context, launches **all $N$ section streams simultaneously** with a 99%-identical prompt prefix (maximizing `vLLM` KV prefix caching across all $N$ slots), and achieves **`2.8×` to `4.2×` higher single-user throughput (`~40–75+ tok/s`)**.
+* **50-Line Hybrid Transient Streamer + Once-Only Progressive Markdown Block Commits (`_BoundedMarkdownView` & `ProgressiveMarkdownStreamer`):**
+  * **Why Naive `Live(Markdown(...))` Breaks SSH Scrollback:** Redrawing a growing multi-line Markdown document 15×/sec over SSH causes visible screen jitter, and once a response exceeds the physical terminal height (`console.size.height`), ANSI cursor-up sequences (`\x1b[<N>A`) clamp at Row 0 of the viewport—pushing duplicate frames into the terminal scrollback buffer on every token chunk.
+  * **Hybrid 50-Line Transient Window + Permanent Block Commits:** While a response is generating, [`_BoundedMarkdownView`](./cjllm.py) renders up to **50 lines** (dynamically bounded by `console.size.height - 2`) of live formatted Markdown above a 1-line token-count-only footer (`⚡ Streaming (N tok)`) inside a `transient=True` `Live` window. If a response exceeds 50 lines while streaming, completed top-level blocks (`\n\n` outside code fences/tables/lists) are progressively committed once above the live window. The instant generation finishes, the transient window clears and [`ProgressiveMarkdownStreamer.finish()`](./cjllm.py) commits all remaining Markdown blocks once into the SSH scrollback buffer for indefinite review.
 
 ##### QuietBox 2 (`P300X2`, 4× Blackhole) 32-Stream Continuous-Batching Benchmark (`DeepSeek-R1-Distill-Qwen-32B`)
 | Simultaneous Streams | Total Output Tokens | Total Wall-Clock Time | TTFT (`min / avg / max`) | Per-Stream Decode Speed | Aggregate Decode Throughput | Net Wall-Clock Throughput | Scaling vs. 1 Stream |
@@ -201,7 +232,7 @@ python3 cjllm.py \
 | `/clear` or `/reset` | Flush conversation history and rolling summary buffer |
 | `/save [filename]` | Save current conversation history and summary buffer to JSON |
 | `/load <filename>` | Load conversation history and summary buffer from JSON |
-| `chat_end` / `exit` / `quit` | Save session to `chat_cache.json` and exit |
+| `chat_end` / `exit` / `quit` / `/exit` / `/quit` | Save session to `chat_cache.json` and exit |
 
 ---
 
