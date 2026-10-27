@@ -65,7 +65,7 @@ User Input
    ▼
 2. Payload Construction & Model-Profile Adaptation (`prepare_request_messages_and_extra`)
    • Single merged system prompt (`BASE_SYSTEM_PROMPT` + `summary_buffer`)
-   • Verbatim sliding window (`MAX_PAIRS = 10` recent user/assistant turns)
+   • Verbatim sliding window (`MAX_PAIRS = 30` pairs / `~20,000` tokens high-water mark, batch-evicting `8` pairs)
    • Active user turn (with injected live web data and anti-hallucination guardrails)
    • Automatic tokenizer prefill & stop-token adaptation based on `MODEL_PROFILE`
    │
@@ -121,7 +121,7 @@ At startup, the harness queries `/v1/models` to auto-discover the active model I
 
 #### E. Quantitative Auto-Think Escalation, High-Precision Memory & Crash-Safe Auto-Save
 * **Quantitative Reasoning Escalation (`needs_quantitative_reasoning`):** When `think_mode = OFF` (default), prompts requiring multi-step math, share allocations, timezone deltas, or physics formulas (such as deep-water wavelength $L = \frac{gT^2}{2\pi}$) automatically enable internal `<|box_start|>` reasoning and instruct the model to write out intermediate equations, maintaining full mathematical accuracy.
-* **High-Precision Numerical Memory Compression (`compress_memory`):** Retains up to `MAX_PAIRS` (default `10`) verbatim user/assistant turn pairs for high KV prefix-cache hit rates across both **NVIDIA DGX Spark** and **Tenstorrent QuietBox 2** (see [`TT_PREFIX_CACHE_FIX.md`](./TT_PREFIX_CACHE_FIX.md)), and folds older turns into `summary_buffer` using a 600-token numerical archivist prompt that preserves every exact price, percentage, wave height, period, temperature, ticker, and buoy station ID verbatim.
+* **High-Water / Batch-Eviction Numerical Memory (`compress_memory_batch`):** Retains up to `MAX_PAIRS = 30` verbatim user/assistant turn pairs (or `~20,000` tokens) before batch-evicting the oldest `EVICT_BATCH = 8` pairs at once into `summary_buffer`. This avoids per-turn KV prefix-cache invalidation across both **NVIDIA DGX Spark** and **Tenstorrent QuietBox 2** (see [`TT_PREFIX_CACHE_FIX.md`](./TT_PREFIX_CACHE_FIX.md)) while using a 700-token numerical archivist prompt that preserves every exact price, percentage, wave height, period, temperature, ticker, and buoy station ID verbatim.
 * **Crash-Safe Persistence:** Automatically saves `chat_cache.json` and `.chat_prompt_history` after every completed turn.
 
 ---
@@ -146,7 +146,9 @@ python3 cjllm.py
 python3 cjllm.py \
   --url http://localhost:8000/v1 \
   --model Qwen/Qwen3-32B \
-  --max-pairs 10 \
+  --max-pairs 30 \
+  --max-verbatim-tokens 20000 \
+  --evict-batch 8 \
   --cache chat_cache.json \
   --think
 ```

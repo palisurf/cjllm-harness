@@ -67,8 +67,20 @@ parser.add_argument(
 parser.add_argument(
     "--max-pairs",
     type=int,
-    default=10,
-    help="Number of verbatim user/assistant turn pairs to retain before rolling compression (default: 10)",
+    default=30,
+    help="High-water mark of verbatim user/assistant turn pairs before batch compression (default: 30)",
+)
+parser.add_argument(
+    "--max-verbatim-tokens",
+    type=int,
+    default=20000,
+    help="High-water mark of approximate verbatim history tokens before batch compression (default: 20000)",
+)
+parser.add_argument(
+    "--evict-batch",
+    type=int,
+    default=8,
+    help="Number of oldest turn pairs to fold in a single batch when high-water mark is reached (default: 8)",
 )
 parser.add_argument(
     "--cache",
@@ -91,6 +103,8 @@ client = OpenAI(
 DEFAULT_CACHE_FILE = args.cache
 COMMAND_HISTORY_FILE = ".chat_prompt_history"
 MAX_PAIRS = args.max_pairs
+MAX_VERBATIM_TOKENS = args.max_verbatim_tokens
+EVICT_BATCH_PAIRS = max(1, min(args.evict_batch, max(1, MAX_PAIRS // 2)))
 
 # --- DEEPSEEK-R1-DISTILL / QWEN3 TOKENIZER BRIDGE CONSTANTS ---
 # When a container serves DeepSeek-R1-Distill-Qwen-32B weights under the Qwen/Qwen3-32B tokenizer:
@@ -1024,17 +1038,30 @@ def needs_quantitative_reasoning(user_input: str) -> bool:
     return any(re.search(pat, u_lower) for pat in quant_patterns)
 
 
-def compress_memory(existing_summary: str, old_user: str, old_assistant: str) -> str:
+def estimate_history_tokens(history: list[dict]) -> int:
+    """Approximates verbatim history token count (~4 chars/token) excluding the system prompt."""
+    return sum(len(m.get("content", "")) for m in history[1:]) // 4
+
+
+def compress_memory_batch(existing_summary: str, evicted_pairs: list[tuple[str, str]]) -> str:
     """
-    Uses a non-thinking completion pass to fold overflowing turn pairs into the summary buffer
-    while preserving all exact numerical figures, tickers, timestamps, and station IDs verbatim.
+    Folds a batch of overflowing (user, assistant) turn pairs into the summary buffer in a
+    single non-thinking LLM call, preserving all exact numerical figures, tickers, timestamps,
+    and station IDs verbatim while avoiding per-turn KV prefix-cache invalidation.
     """
+    if not evicted_pairs:
+        return existing_summary
+
+    turns_block = "\n\n".join(
+        f"Turn {idx + 1}:\nUser: {u_txt}\nAssistant Answer: {a_txt}"
+        for idx, (u_txt, a_txt) in enumerate(evicted_pairs)
+    )
     prompt = (
         f"Existing Conversation Summary:\n{existing_summary if existing_summary else 'None'}\n\n"
-        f"New Turn to Integrate:\nUser: {old_user}\nAssistant Answer: {old_assistant}\n\n"
-        "Produce an updated, dense bulleted memory log (up to 12 concise bullets) that:\n"
+        f"New Turns to Integrate ({len(evicted_pairs)} turn(s)):\n{turns_block}\n\n"
+        "Produce an updated, dense bulleted memory log (up to 15 concise bullets) that:\n"
         "1. Retains all existing facts and topics from Existing Conversation Summary.\n"
-        "2. Integrates the New Turn while preserving EVERY exact number, stock price, point/percentage change, "
+        "2. Integrates the New Turns while preserving EVERY exact number, stock price, point/percentage change, "
         "wave height, wave period, wave direction, temperature, date/time, ticker symbol, and 5-digit buoy station ID verbatim.\n"
         "3. NEVER replaces specific numbers with vague prose (for example, write "
         "'Buoy 46221: WVHT 3.6 ft (1.1 m), DPD 14 sec, APD 6.9 sec, MWD 284 deg, WTMP 63.1°F; "
@@ -1042,7 +1069,9 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
         "Output ONLY the bulleted list with no preamble or meta-commentary."
     )
     try:
-        console.print("[dim]Updating rolling memory summary buffer...[/dim]")
+        console.print(
+            f"[dim]Batch-compressing {len(evicted_pairs)} oldest turn pair(s) into rolling summary buffer...[/dim]"
+        )
         base_messages = [
             {
                 "role": "system",
@@ -1060,7 +1089,7 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
             "model": MODEL_NAME,
             "messages": req_messages,
             "temperature": 0.0,
-            "max_tokens": 600,
+            "max_tokens": 700,
         }
         if extra_params:
             create_kwargs["extra_body"] = extra_params
@@ -1072,8 +1101,15 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
     except Exception:
         pass
 
-    entry = f"User asked: '{old_user}' | Assistant answered: '{old_assistant[:240]}...'"
-    return f"{existing_summary}\n- {entry}" if existing_summary else f"- {entry}"
+    fallback_entries = "\n".join(
+        f"- User asked: '{u_txt}' | Assistant answered: '{a_txt[:240]}...'" for u_txt, a_txt in evicted_pairs
+    )
+    return f"{existing_summary}\n{fallback_entries}" if existing_summary else fallback_entries
+
+
+def compress_memory(existing_summary: str, old_user: str, old_assistant: str) -> str:
+    """Single-pair wrapper around compress_memory_batch for backward compatibility."""
+    return compress_memory_batch(existing_summary, [(old_user, old_assistant)])
 
 
 # --- Session Startup ---
@@ -1128,7 +1164,9 @@ verbose_mode = False
 think_mode = bool(args.think)
 
 console.print("\n[bold]Commands:[/bold]")
-console.print(f"  [cyan]Max Pairs Configured[/cyan] : Retaining {MAX_PAIRS} verbatim pairs before rolling buffer compression")
+console.print(
+    f"  [cyan]Memory Window[/cyan]        : High-water {MAX_PAIRS} pairs (~{MAX_VERBATIM_TOKENS:,} tokens), batch-evicting {EVICT_BATCH_PAIRS} pairs"
+)
 console.print("  [cyan]/clear[/cyan]               : Flush conversation history & summary buffer")
 console.print("  [cyan]/think[/cyan]               : Toggle Chain-of-Thought reasoning mode (default: OFF)")
 console.print("  [cyan]/think <query>[/cyan]       : Run a single query with Chain-of-Thought reasoning enabled")
@@ -1347,20 +1385,27 @@ while True:
         else:
             console.print("[bold red][Warning][/bold red] Discarded low-quality or corrupted assistant turn from history.")
 
-        # --- ROLLING MEMORY COMPRESSION BUFFER ---
+        # --- ROLLING MEMORY COMPRESSION BUFFER (HIGH-WATER / LOW-WATER BATCH EVICTION) ---
         current_pairs = (len(conversation_history) - 1) // 2
+        current_verbatim_tokens = estimate_history_tokens(conversation_history)
 
-        while current_pairs > MAX_PAIRS:
-            old_user_msg = conversation_history.pop(1)
-            old_assistant_msg = conversation_history.pop(1)
+        if current_pairs > MAX_PAIRS or (current_verbatim_tokens > MAX_VERBATIM_TOKENS and current_pairs > 4):
+            target_keep_pairs = max(4, MAX_PAIRS - EVICT_BATCH_PAIRS)
+            evicted_batch: list[tuple[str, str]] = []
+            while current_pairs > target_keep_pairs or (
+                estimate_history_tokens(conversation_history) > (MAX_VERBATIM_TOKENS - 3000) and current_pairs > 4
+            ):
+                old_user_msg = conversation_history.pop(1)
+                old_assistant_msg = conversation_history.pop(1)
+                evicted_batch.append(
+                    (old_user_msg.get("content", ""), old_assistant_msg.get("content", ""))
+                )
+                current_pairs = (len(conversation_history) - 1) // 2
+                if len(evicted_batch) >= EVICT_BATCH_PAIRS and current_pairs <= MAX_PAIRS:
+                    break
 
-            summary_buffer = compress_memory(
-                summary_buffer,
-                old_user_msg.get("content", ""),
-                old_assistant_msg.get("content", ""),
-            )
-
-            current_pairs = (len(conversation_history) - 1) // 2
+            if evicted_batch:
+                summary_buffer = compress_memory_batch(summary_buffer, evicted_batch)
 
         # Silently persist cache and prompt history after each turn
         de_hydrate_cache(conversation_history, summary_buffer, DEFAULT_CACHE_FILE, silent=True)
