@@ -1511,25 +1511,53 @@ def plan_parallel_sections(user_input: str) -> list[str] | None:
     ]
 
 
-class ProgressiveMarkdownStreamer:
+class _BoundedMarkdownView:
     """
-    SSH- & Scrollback-Safe Progressive Markdown Streamer:
-    - Why standard `Live(Markdown(full_response))` jitters and breaks SSH scrollback:
-      Redrawing a multi-line Markdown document 15x/sec sends ANSI cursor-up sequences (`\\x1b[<N>A`).
-      Over SSH, erasing and re-printing dozens of lines causes visible flicker/jitter, and once the
-      response exceeds 1 terminal screen height (~40 lines), cursor-up clamps at row 0 of the viewport,
-      pushing duplicate frames into the terminal scrollback buffer on every token chunk.
-    - How `ProgressiveMarkdownStreamer` solves both:
-      1. The mutable `Live` region is strictly a single non-wrapping 1-line status ticker (`no_wrap=True`,
-         `transient=True`) at the very bottom of the screen, so cursor-up never exceeds 1 line and ZERO
-         duplicate frames ever enter the SSH scrollback buffer.
-      2. As soon as a self-contained Markdown block (heading, paragraph, completed table, completed list,
-         or closed code fence) finishes at a `\\n\\n` boundary, it is permanently printed ONCE above the
-         status ticker via `live.console.print(Markdown(block))` and never redrawn again.
+    Hybrid 50-Line Transient Live Streaming View:
+    Renders live formatted `Markdown(md_text)` + a 1-line status bar clamped to at most `max_lines`
+    (default 50 lines, dynamically bounded by `console.size.height - 2` so it never overflows a smaller
+    SSH terminal window). If the in-progress Markdown exceeds the line budget, keeps the bottom (newest)
+    lines visible so `rich.live.Live` never pushes duplicate frames into the SSH scrollback buffer.
     """
 
-    def __init__(self, target_console: Console):
+    def __init__(self, md_text: str, status_line: Text, max_lines: int = 50):
+        self.md_text = md_text
+        self.status_line = status_line
+        self.max_lines = max_lines
+
+    def __rich_console__(self, console_obj: Console, options):
+        from rich.segment import Segment
+
+        avail_height = min(self.max_lines, max(4, console_obj.size.height - 2))
+        body_budget = max(1, avail_height - 1)
+        if self.md_text and self.md_text.strip():
+            rendered_lines = console_obj.render_lines(Markdown(self.md_text), options, pad=False)
+            if len(rendered_lines) > body_budget:
+                rendered_lines = rendered_lines[-body_budget:]
+            new_line = Segment.line()
+            for line_segments in rendered_lines:
+                yield from line_segments
+                yield new_line
+        yield self.status_line
+
+
+class ProgressiveMarkdownStreamer:
+    """
+    Hybrid 50-Line Transient Live Streamer + Once-Only Progressive Markdown Block Commits:
+    1. While the response is generating, displays up to 50 lines (`max_live_lines = 50`, safely bounded by
+       `console.size.height - 2`) of live-rendered Markdown inside a `transient=True` `Live` window so the
+       user can read the full streaming content in real time.
+    2. If a long response exceeds the 50-line window while still streaming, completed top-level Markdown
+       blocks (`\\n\\n` boundaries outside code fences/tables/lists) are progressively committed ONCE to
+       scrollback above the transient window so the live region never overflows the viewport.
+    3. As soon as the response completes, the transient 50-line live window clears (`transient=True`) and
+       switches to Once-Only Progressive Markdown Block Commits (`finish`), printing all remaining blocks
+       permanently into the SSH scrollback buffer for indefinite review.
+    """
+
+    def __init__(self, target_console: Console, max_live_lines: int = 50):
         self.console = target_console
+        self.max_live_lines = max_live_lines
         self.committed_char_len = 0
         self.token_count = 0
 
@@ -1620,21 +1648,46 @@ class ProgressiveMarkdownStreamer:
             self.committed_char_len = 0
 
         uncommitted = display_text[self.committed_char_len :]
-        cut = self._find_safe_commit_boundary(uncommitted)
-        if cut > 0:
+        avail_height = min(self.max_live_lines, max(4, self.console.size.height - 2))
+        body_budget = max(1, avail_height - 1)
+
+        # Keep the live streaming content inside the 50-line transient window until it completes;
+        # only commit early if the uncommitted Markdown grows past the 50-line (or viewport) budget!
+        if uncommitted.strip():
+            rendered_lines = self.console.render_lines(Markdown(uncommitted), self.console.options, pad=False)
+            if len(rendered_lines) > body_budget:
+                cut = self._find_safe_commit_boundary(uncommitted)
+                if cut > 0:
+                    block_to_commit = uncommitted[:cut].strip()
+                    if block_to_commit:
+                        live.console.print(Markdown(block_to_commit))
+                        live.console.print()
+                    self.committed_char_len += cut
+                    uncommitted = display_text[self.committed_char_len :]
+
+        status_line = self.make_status_line(uncommitted, prefix_label=prefix_label)
+        live.update(_BoundedMarkdownView(uncommitted, status_line, max_lines=self.max_live_lines))
+
+    def finish(self, display_text: str):
+        """
+        Once-Only Progressive Markdown Block Commits after response completion:
+        Commits all remaining Markdown blocks permanently into the terminal scrollback buffer.
+        """
+        if len(display_text) < self.committed_char_len:
+            self.committed_char_len = 0
+        uncommitted = display_text[self.committed_char_len :]
+        while True:
+            cut = self._find_safe_commit_boundary(uncommitted)
+            if cut <= 0:
+                break
             block_to_commit = uncommitted[:cut].strip()
             if block_to_commit:
-                live.console.print(Markdown(block_to_commit))
-                live.console.print()
+                self.console.print(Markdown(block_to_commit))
+                self.console.print()
             self.committed_char_len += cut
             uncommitted = display_text[self.committed_char_len :]
 
-        live.update(self.make_status_line(uncommitted, prefix_label=prefix_label))
-
-    def finish(self, display_text: str):
-        if len(display_text) < self.committed_char_len:
-            self.committed_char_len = 0
-        remainder = display_text[self.committed_char_len :].strip()
+        remainder = uncommitted.strip()
         if remainder:
             self.console.print(Markdown(remainder))
 
@@ -1733,20 +1786,28 @@ def stream_parallel_sections(
             return cleaned_sec
         return f"### {idx + 1}. {title}\n*(No content)*"
 
-    def _make_parallel_status_line() -> Text:
+    def _make_parallel_live_view(start_sec_idx: int) -> _BoundedMarkdownView:
         with lock:
             badges = []
             total_chars = 0
+            preview_parts = []
             for i in range(n_streams):
                 n_tok_est = section_tokens[i] or (len(section_buffers[i]) // 4)
                 total_chars += len(section_buffers[i])
                 state = "✓" if section_done[i] else f"{n_tok_est}t"
                 badges.append(f"S{i + 1}:{state}")
+                if i >= start_sec_idx and section_buffers[i].strip():
+                    cleaned_part = strip_thinking_and_dedup(section_buffers[i])
+                    if cleaned_part:
+                        if not cleaned_part.lstrip().startswith("#"):
+                            cleaned_part = f"### {i + 1}. {sections[i]}\n{cleaned_part}"
+                        preview_parts.append(cleaned_part)
             status_str = " ".join(badges)
+            live_md = "\n\n---\n\n".join(preview_parts)
         line = Text(no_wrap=True, overflow="ellipsis")
         line.append(f"⚡ Parallel Map-Reduce ({n_streams} streams | ~{total_chars // 4} tok): ", style="bold cyan")
         line.append(status_str, style="dim")
-        return line
+        return _BoundedMarkdownView(live_md, line, max_lines=50)
 
     threads = [
         threading.Thread(target=_run_section_stream, args=(i, sec_title), daemon=True)
@@ -1757,7 +1818,7 @@ def stream_parallel_sections(
 
     next_to_print = 0
     with Live(
-        _make_parallel_status_line(),
+        _make_parallel_live_view(0),
         console=console,
         refresh_per_second=8,
         transient=True,
@@ -1773,7 +1834,7 @@ def stream_parallel_sections(
                 live.console.print(Markdown(sec_md))
                 live.console.print()
                 next_to_print += 1
-            live.update(_make_parallel_status_line())
+            live.update(_make_parallel_live_view(next_to_print))
             time.sleep(0.08)
 
         while next_to_print < n_streams:
