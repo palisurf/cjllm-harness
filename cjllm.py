@@ -1067,40 +1067,112 @@ def requires_post_cutoff_search(user_input: str) -> bool:
     return bool(re.search(office_or_title_pat, u_lower) and re.search(temporal_qualifier_pat, u_lower))
 
 
-def determine_search_query(user_input: str, history: list) -> str | None:
+def is_search_opt_out_query(user_input: str) -> bool:
     """
-    Fast, context-aware classification pass:
-    - Deterministically skips pure coding/math/physics prompts that don't request live external lookup.
-    - Enforces post-2024 cutoff verification for current/recent officeholders, presidents, CEOs, and champions.
-    - Injects today's system date so 'current'/'today'/'latest' queries use the real year (not training cutoff).
-    - Uses up to the last 3 conversation turn pairs (600 chars/turn) + extracted station/ticker IDs
-      to resolve multi-hop pronouns ('that buoy', 'the second one', 'their', 'it').
-    - Automatically adapts to the active MODEL_PROFILE (skipping CoT when supported).
+    Search-by-Default Opt-Out Guard:
+    Returns True ONLY when the prompt is strictly:
+      1. Built-in clock/calendar skill (without external data requests),
+      2. Pure coding / math / algebra / physics formula evaluation, or
+      3. A formatting, sorting, editing, or memory-recall command operating strictly on previous turns
+         (e.g., 'sort that table', 'make it shorter', 'convert to JSON', 'from our conversation so far').
+    All other prompts default to live web search.
     """
     u_lower = user_input.lower().strip()
-    must_search_post_cutoff = requires_post_cutoff_search(user_input)
 
-    # Fast deterministic guard: pure clock/date/day-of-week queries are answered by the built-in Current Time Skill
+    # 1. Built-in Current Time & Calendar Skill
     if is_clock_skill_query(user_input) and not is_external_data_query(user_input):
-        return None
+        return True
 
-    # Fast deterministic route for US President queries (avoids LLM router hallucinating pre-2025 officeholders into the query)
-    if must_search_post_cutoff and re.search(r"\bpresidents?\b", u_lower) and not re.search(
+    # Never opt out if the user explicitly asks to search/pull live web data
+    if re.search(r"\b(search\s+the\s+web|pull\s+live|search\s+online|look\s+up\s+online)\b", u_lower):
+        return False
+
+    # 2. Pure coding / scripting / debugging / regex / SQL generation
+    if re.search(
+        r"\b(write\s+a\s+(?:python|bash|sh|c|c\+\+|rust|go|golang|java|javascript|js|typescript|ts|sql|html|css|ruby|perl|script|function|program|class|regex|query)\b|"
+        r"implement\s+a\s+(?:function|class|method|script|algorithm)\b|"
+        r"debug\s+this|refactor\s+this|fix\s+this\s+(?:code|bug|error|script|function)|"
+        r"explain\s+this\s+(?:code|function|regex))\b",
+        u_lower,
+    ) and not re.search(r"\b(noaa|ndbc|buoy\s+\d{5}|yahoo\s+finance)\b", u_lower):
+        return True
+
+    # 3. Pure math, algebra, calculus, textbook physics formulas, or arithmetic on in-context figures
+    if re.search(
+        r"\b(solve\s+for\s+[a-z]\b|derivative\s+of\b|integrate\b|factor\s+the\b|eigenvalue|determinant\s+of\b|"
+        r"electric\s+current\s+in\s+a\s+circuit|ohm'?s\s+law|"
+        r"calculate\s+the\s+deep-water\s+wavelength|deep-water\s+wave\s+formula|"
+        r"using\s+that\s+dominant\s+swell\s+period\b.*calculate|"
+        r"using\s+the\s+exact\s+prices\s+from\s+our\s+conversation|"
+        r"how\s+many\s+whole\s+shares\s+of\s+each\s+can\s+i\s+buy)\b",
+        u_lower,
+    ):
+        return True
+
+    # 4. Formatting, sorting, shortening, converting, or summarizing previous conversation turns
+    if re.search(
+        r"^(sort\s+that|sort\s+the\s+table|make\s+(?:it|that|this|the\s+table)\s+(?:shorter|longer|concise|brief|narrower|wider)|"
+        r"convert\s+(?:that|it|this|those|the\s+table)\s+(?:to|into)\s+(?:json|csv|markdown|yaml|xml|html|bullet|bullets|table|euros|pounds|meters|feet|celsius|fahrenheit)|"
+        r"format\s+(?:that|it|this)\s+as|reformat\s+(?:that|it|this)|rewrite\s+(?:that|it|this)|"
+        r"summarize\s+(?:what\s+we|our\s+conversation|the\s+above|that|it|every\s+stock)|"
+        r"translate\s+(?:that|it|this)\s+(?:to|into)|"
+        r"what\s+were\s+the\s+exact\s+.*(?:we\s+discussed|earlier\s+in\s+our\s+conversation))\b",
+        u_lower,
+    ) or re.search(
+        r"\b(from\s+our\s+conversation\s+so\s+far|we\s+discussed\s+earlier|in\s+our\s+chat\s+history|without\s+searching)\b",
+        u_lower,
+    ):
+        return True
+
+    return False
+
+
+def _build_fallback_search_query(user_input: str, current_year: int) -> str:
+    """Constructs a clean keyword search query from user_input when the LLM router returns NONE or prose."""
+    u_lower = user_input.lower().strip()
+    if re.search(r"\bpresidents?\b", u_lower) and not re.search(
         r"\b(france|french|mexico|mexican|russia|russian|china|chinese|ukraine|ukrainian|brazil|brazilian|iran|iranian|korea|korean|taiwan|india|indian|argentina|turkey|turkish|poland|polish|philippines|indonesia|south\s+africa|nigeria|egypt|colombia|venezuela|company|university|college|bank|fed|federal\s+reserve|senate|council|board|club)\b",
         u_lower,
     ):
         return "List of presidents of the United States Wikipedia"
 
-    # Fast deterministic guard against pure coding / math / textbook physics false positives
-    is_pure_code_or_math = (
-        re.search(
-            r"\b(write\s+a\s+(?:python|bash|c\+\+|rust|javascript|js|sql|html)\b|write\s+a\s+(?:script|function|program|class)\b|implement\s+a\s+function|electric\s+current\s+in\s+a\s+circuit|ohm'?s\s+law|solve\s+for\s+[a-z]\b|derivative\s+of\b|integrate\b)",
-            u_lower,
-        )
-        and not re.search(r"\b(search\s+the\s+web|pull\s+live|noaa|ndbc|buoy\s+\d{5}|yahoo\s+finance)\b", u_lower)
+    cleaned_fallback = re.sub(
+        r"\b(show\s+me|tell\s+me|can\s+you|could\s+you|what\s+is|what\s+are|who\s+is|who\s+are|where\s+is|when\s+is|how\s+much|the|with|for|create|a|an|table|this|please|format|in|go|and|pull|information|from|publically|publicly|available|data|on)\b",
+        " ",
+        user_input,
+        flags=re.I,
     )
-    if is_pure_code_or_math:
+    cleaned_fallback = re.sub(r"[?!.,;:\"'`]+", " ", cleaned_fallback)
+    cleaned_fallback = re.sub(r"\s+", " ", cleaned_fallback).strip()
+    base_q = cleaned_fallback[:75] if cleaned_fallback else user_input[:75]
+    if re.search(r"\b(current|currently|present|incumbent|now|today|latest|recent|most\s+recent)\b", u_lower) and str(current_year) not in base_q:
+        base_q = f"{base_q} {current_year}"
+    return base_q.strip()
+
+
+def determine_search_query(user_input: str, history: list) -> str | None:
+    """
+    Search-by-Default Query Formulator (Opt-Out Only for Clock/Code/Math/Formatting):
+    - Instead of asking the model whether it 'needs' web search (which fails whenever facts
+      changed after its 2024 pre-training cutoff), ALWAYS generates a search query unless
+      `is_search_opt_out_query(user_input)` is True or the prompt is strictly a formatting/editing
+      command on the previous turn.
+    - Uses up to the last 3 conversation turn pairs (600 chars/turn) + extracted station/ticker IDs
+      to resolve multi-hop pronouns ('that buoy', 'the second one', 'their', 'for today only instead').
+    """
+    u_lower = user_input.lower().strip()
+    current_year = datetime.now(LOCAL_TZ).year
+
+    # Fast deterministic opt-out for clock skill, pure coding/math/formulas, or formatting/recall commands
+    if is_search_opt_out_query(user_input):
         return None
+
+    # Fast deterministic route for US President queries (guarantees authoritative chronological table)
+    if re.search(r"\bpresidents?\b", u_lower) and not re.search(
+        r"\b(france|french|mexico|mexican|russia|russian|china|chinese|ukraine|ukrainian|brazil|brazilian|iran|iranian|korea|korean|taiwan|india|indian|argentina|turkey|turkish|poland|polish|philippines|indonesia|south\s+africa|nigeria|egypt|colombia|venezuela|company|university|college|bank|fed|federal\s+reserve|senate|council|board|club)\b",
+        u_lower,
+    ):
+        return "List of presidents of the United States Wikipedia"
 
     today_str, _, _ = get_dual_clock_str()
     recent_turns = history[1:][-6:]  # Up to the last 3 user/assistant pairs
@@ -1139,16 +1211,17 @@ def determine_search_query(user_input: str, history: list) -> str | None:
             {
                 "role": "system",
                 "content": (
-                    f"You are a search intent evaluator. Today's date is {today_str}.\n"
-                    "Determine if the Latest User Prompt requires real-time web search data, "
-                    "stock prices, financial quotes, rankings/tables, recent news, current weather, surf/swell/tide/buoy reports, specific URLs/repositories, product availability, or external specs.\n"
-                    f"- CRITICAL CUTOFF RULE: Your internal pre-training knowledge ended in 2024, whereas today is {today_str}. NEVER return 'NONE' for any question about current, incumbent, present, latest, or 'last N' political leaders, presidents ('who is the current president', 'last 5 presidents'), prime ministers, governors, CEOs, sports champions, award winners, or events that could have changed since 2024 — EVEN IF a previous turn in Recent Conversation Context already stated an answer! When 'president' is asked without a country, assume 'United States' (e.g. 'list of Presidents of the United States').\n"
-                    "- Use Recent Conversation Context to resolve pronouns, implicit topic references (e.g., 'for today only instead', 'that buoy', 'the second one'), or when previous turns failed to provide the requested data.\n"
+                    f"You are a search query formulator. Today's date is {today_str} (Year: {current_year}).\n"
+                    "We operate in SEARCH-BY-DEFAULT mode because your internal pre-training weights ended in 2024.\n"
+                    "- ALWAYS output a concise 2-10 word web search query for the Latest User Prompt UNLESS the prompt is strictly:\n"
+                    "  (1) Pure code generation or debugging ('write a Python script...'),\n"
+                    "  (2) Pure math, algebra, or physics formula evaluation on already-provided numbers, or\n"
+                    "  (3) A formatting, sorting, shortening, or conversion command on the previous turn ('sort that table', 'make it shorter', 'convert to JSON').\n"
+                    "- For ALL factual, historical, scientific, entity, leader/president/CEO, product, financial, weather, or ocean buoy prompts, NEVER output 'NONE' — formulate the best 2-10 word web search query.\n"
+                    "- Use Recent Conversation Context to resolve pronouns and implicit references (e.g., 'for today only instead', 'that buoy', 'the second one', 'their CEO').\n"
                     "- When Recent Conversation Context contains a specific 5-digit NOAA buoy station ID (e.g., 46221, 46054, 46218) that matches the buoy referenced by the user, ALWAYS include that exact 5-digit station ID (e.g. 'NOAA buoy 46054 wave height water temp') in your search query.\n"
-                    f"- When the user asks for 'current', 'latest', or 'today', use the current date/year ({today_str}) in your search query (NEVER use 2023 or 2024).\n"
-                    "- If the user asks to pull data, search, update, verify, or narrow a previous real-time data request (such as 'for today only instead'), ALWAYS output a search query combining the topic from Recent Conversation Context with the Latest User Prompt.\n"
-                    "- If search IS NOT needed (pure math, coding, abstract reasoning, or timeless pre-2024 historical/scientific facts), reply ONLY with 'NONE'.\n"
-                    "- If search IS needed, reply ONLY with a concise 2-10 word web search query (NO explanations or preamble)."
+                    f"- When the user asks for 'current', 'latest', 'present', or 'today', include {current_year} in your search query (NEVER use 2023 or 2024).\n"
+                    "- Reply ONLY with the concise 2-10 word web search query (or 'NONE' ONLY for pure code/math/formatting). No explanations or full sentences."
                 ),
             },
             {"role": "user", "content": eval_input},
@@ -1168,7 +1241,7 @@ def determine_search_query(user_input: str, history: list) -> str | None:
         response = client.chat.completions.create(**create_kwargs)
         res_text = strip_thinking_and_dedup(response.choices[0].message.content or "")
         if not res_text:
-            return None
+            return _build_fallback_search_query(user_input, current_year)
 
         # If the model included a label like "Search Query:", extract what follows
         for marker in ("Search Query:", "search query:", "Query:", "query:"):
@@ -1179,11 +1252,14 @@ def determine_search_query(user_input: str, history: list) -> str | None:
         res_text = lines[-1] if lines else ""
 
         if not res_text or res_text.upper().startswith("NONE") or res_text.upper() == "NONE":
-            if must_search_post_cutoff:
-                if "president" in u_lower and any(x in u_lower for x in ("usa", "u.s", "united states", "current", "last")):
-                    return "list of Presidents of the United States Wikipedia"
-                return f"{user_input} {datetime.now(LOCAL_TZ).year}"
-            return None
+            # In Search-by-Default mode, only honor NONE if the prompt looks like a follow-up edit/calculation/code request;
+            # otherwise override NONE with a fallback keyword query so 2024 cutoff blindness can never suppress search.
+            if re.search(
+                r"\b(sort|reformat|shorten|summarize|translate|rewrite|convert|calculate|compute|code|script|function|equation|formula|earlier|previous|above)\b",
+                u_lower,
+            ) and not is_external_data_query(user_input) and not requires_post_cutoff_search(user_input):
+                return None
+            return _build_fallback_search_query(user_input, current_year)
 
         # Guard against leaked reasoning sentences or declarative answers ("The current ... is ...") being sent to DuckDuckGo
         lower_q = res_text.lower()
@@ -1195,14 +1271,7 @@ def determine_search_query(user_input: str, history: list) -> str | None:
             phrase in lower_q
             for phrase in ("to determine", "i'll analyze", "i will analyze", "the user is asking", "user's request")
         ):
-            cleaned_fallback = re.sub(
-                r"\b(show me|who|is|are|was|were|the|with|for|create|a|table|this|please|format|in|go|and|pull|information|from|publically|available|data|on)\b",
-                " ",
-                user_input,
-                flags=re.I,
-            )
-            cleaned_fallback = re.sub(r"\s+", " ", cleaned_fallback).strip()
-            res_text = f"{cleaned_fallback} {datetime.now(LOCAL_TZ).year}".strip()[:80] if cleaned_fallback else user_input[:80]
+            res_text = _build_fallback_search_query(user_input, current_year)
 
         res_text = res_text.replace('"', "").replace("'", "")
 
@@ -1230,7 +1299,7 @@ def determine_search_query(user_input: str, history: list) -> str | None:
 
         return res_text
     except Exception:
-        return None
+        return _build_fallback_search_query(user_input, current_year)
 
 
 def needs_quantitative_reasoning(user_input: str) -> bool:
@@ -1240,6 +1309,11 @@ def needs_quantitative_reasoning(user_input: str) -> bool:
     instruct the model to show explicit intermediate equations even when think_mode is OFF.
     """
     u_lower = user_input.lower()
+    if re.search(
+        r"\b(write\s+a\s+(?:python|bash|sh|c|c\+\+|rust|go|golang|java|javascript|js|typescript|ts|sql|html|css|script|function|program|class)|implement\s+a\s+(?:function|class|method|script|algorithm))\b",
+        u_lower,
+    ):
+        return False
     quant_patterns = (
         r"\b(calculate|compute|derive|solve|formula|equation|wavelength|phase\s+speed)\b",
         r"\b(how\s+many\s+(?:whole\s+)?shares|left\s+over|remainder|split\s+\d+\s*/\s*\d+|allocation)\b",
@@ -1323,89 +1397,6 @@ def compress_memory_batch(existing_summary: str, evicted_pairs: list[tuple[str, 
 def compress_memory(existing_summary: str, old_user: str, old_assistant: str) -> str:
     """Single-pair wrapper around compress_memory_batch for backward compatibility."""
     return compress_memory_batch(existing_summary, [(old_user, old_assistant)])
-
-
-def race_router_and_speculative_stream(
-    user_input: str,
-    history: list[dict],
-    spec_active_payload: list[dict],
-    spec_extra_body: dict,
-    effective_thinking: bool,
-) -> tuple[str | None, queue.Queue | None, dict | None]:
-    """
-    Feature B — Speculative Router + Direct-Answer Racing:
-    Fires `determine_search_query` (Slot 1) and the direct-response stream (Slot 2) simultaneously.
-    - If Slot 1 returns `None` (no web search needed), Slot 2 is already prefilled and streaming tokens,
-      hiding the ~250-400ms search-router latency completely.
-    - If Slot 1 returns a search query, Slot 2 is immediately aborted/closed (<1ms) to free the server slot.
-    """
-    u_lower = user_input.lower().strip()
-    if (is_clock_skill_query(user_input) and not is_external_data_query(user_input)) or (
-        re.search(
-            r"\b(write\s+a\s+(?:python|bash|c\+\+|rust|javascript|js|sql|html)\b|write\s+a\s+(?:script|function|program|class)\b|implement\s+a\s+function|electric\s+current\s+in\s+a\s+circuit|ohm'?s\s+law|solve\s+for\s+[a-z]\b|derivative\s+of\b|integrate\b)",
-            u_lower,
-        )
-        and not re.search(r"\b(search\s+the\s+web|pull\s+live|noaa|ndbc|buoy\s+\d{5}|yahoo\s+finance)\b", u_lower)
-    ):
-        # Deterministic direct query: no router LLM call needed at all
-        return None, None, None
-
-    # If the prompt deterministically requires post-2024 cutoff verification, skip speculative direct stream
-    if requires_post_cutoff_search(user_input):
-        return determine_search_query(user_input, history), None, None
-
-    spec_queue: queue.Queue = queue.Queue()
-    abort_event = threading.Event()
-    spec_meta = {
-        "start_time": time.perf_counter(),
-        "first_token_time": None,
-        "abort_event": abort_event,
-    }
-
-    def _spec_stream_worker():
-        stream_obj = None
-        try:
-            stream_kwargs = {
-                "model": MODEL_NAME,
-                "messages": spec_active_payload,
-                "temperature": 0.6 if effective_thinking else 0.7,
-                "max_tokens": MODEL_PROFILE["max_gen_tokens"],
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            }
-            if spec_extra_body:
-                stream_kwargs["extra_body"] = spec_extra_body
-
-            stream_obj = client.chat.completions.create(**stream_kwargs)
-            for chunk in stream_obj:
-                if abort_event.is_set():
-                    break
-                if chunk.choices and len(chunk.choices) > 0:
-                    delta = chunk.choices[0].delta.content or ""
-                    if delta and spec_meta["first_token_time"] is None:
-                        spec_meta["first_token_time"] = time.perf_counter()
-                spec_queue.put(("chunk", chunk))
-        except Exception as e:
-            if not abort_event.is_set():
-                spec_queue.put(("error", e))
-        finally:
-            if abort_event.is_set() and stream_obj is not None:
-                try:
-                    stream_obj.close()
-                except Exception:
-                    pass
-            spec_queue.put(("done", None))
-
-    worker_thread = threading.Thread(target=_spec_stream_worker, daemon=True)
-    worker_thread.start()
-
-    search_query = determine_search_query(user_input, history)
-    if search_query is not None:
-        # Web search is required -> immediately abort speculative direct stream
-        abort_event.set()
-        return search_query, None, None
-
-    return None, spec_queue, spec_meta
 
 
 def detect_auto_parallel_sections(user_input: str) -> list[str] | None:
@@ -2002,30 +1993,12 @@ while True:
                 else user_input
             )
 
-        spec_queue = None
-        spec_meta = None
-
-        if parallel_sections:
-            # Automatic Section-Parallel turn: determine if web search is needed first
-            if use_clock_skill and not is_external_data_query(user_input):
-                search_query = None
-            else:
-                console.print("[dim]Analyzing search intent...[/dim]", end="\r")
-                search_query = determine_search_query(user_input, conversation_history)
+        # 4. Search-by-Default Router (Opt-Out Only for Clock Skill, Pure Code/Math, or Formatting/Recall)
+        if use_clock_skill and not is_external_data_query(user_input):
+            search_query = None
         else:
-            # Standard turn: Feature B — Speculative Router + Direct-Answer Racing
-            spec_base_payload = list(base_prefix_messages) + [{"role": "user", "content": direct_user_content}]
-            spec_active_payload, spec_extra_body = prepare_request_messages_and_extra(
-                spec_base_payload, use_thinking=effective_thinking, is_utility_call=False
-            )
-            console.print("[dim]Analyzing search intent (speculative direct stream active)...[/dim]", end="\r")
-            search_query, spec_queue, spec_meta = race_router_and_speculative_stream(
-                user_input,
-                conversation_history,
-                spec_active_payload,
-                spec_extra_body,
-                effective_thinking,
-            )
+            console.print("[dim]Formulating web search query...[/dim]", end="\r")
+            search_query = determine_search_query(user_input, conversation_history)
 
         if search_query:
             console.print(f"[dim]Searching web (max 5) for: '[bold cyan]{search_query}[/bold cyan]'...[/dim]")
@@ -2035,17 +2008,15 @@ while True:
                 f"{skill_prefix}{web_payload}\n"
                 "### INSTRUCTIONS:\n"
                 f"Today's date is {CURRENT_DATE_STR}. Your internal pre-training knowledge ended in 2024.\n"
-                "- Answer the Active User Request below using the live web search data and extracted tables above.\n"
+                "- Use the live 2026 web data whenever it is relevant or updates your 2024 training weights; if the web snippets are unrelated to an abstract/conceptual question, rely on your internal knowledge.\n"
                 "- CRITICAL: Chronological tables (such as lists of Presidents, leaders, or champions) list the oldest entries at the top and the MOST RECENT / INCUMBENT entries (2025–2026) at the bottom. Always check the bottom rows (e.g., #47 / 'Incumbent' / 2025–present) and override both your 2024 pre-training memory AND any stale earlier conversation turns with the 2025–2026 facts in the table!\n"
                 "- When asked for the 'last N' or 'most recent N' presidents, leaders, or winners, list them in reverse chronological order starting from the current 2025–2026 incumbent at the bottom of the table (e.g., for last 5 US Presidents: start at #47 Donald Trump [2025–Incumbent], #46 Joe Biden [2021–2025], #45 Donald Trump [2017–2021], #44 Barack Obama [2009–2017], #43 George W. Bush [2001–2009], and #42 Bill Clinton [1993–2001] so both the last 5 presidencies and last 5 distinct individuals are clear)."
                 f"{quant_instruction}\n\n"
                 f"### ACTIVE USER REQUEST:\n{user_input}"
             )
         else:
-            if spec_queue is not None:
-                console.print("[dim]Direct response (speculative stream hit — router latency hidden).[/dim]")
-            elif not use_clock_skill:
-                console.print("[dim]Direct response (no web search needed).[/dim]")
+            if not use_clock_skill:
+                console.print("[dim]Direct response (code/math/formatting opt-out — no web search needed).[/dim]")
             active_user_content = direct_user_content
 
         # --- EXECUTE GENERATION (AUTO SECTION-PARALLEL OR SINGLE STREAM) ---
@@ -2105,104 +2076,62 @@ while True:
 
             prog_streamer = ProgressiveMarkdownStreamer(console)
 
-            if spec_queue is not None and spec_meta is not None:
-                # Consume the already-running speculative direct stream
-                start_time = spec_meta["start_time"]
-                first_token_time = spec_meta["first_token_time"]
-                with Live(
-                    prog_streamer.make_status_line(""),
-                    console=console,
-                    refresh_per_second=8,
-                    transient=True,
-                ) as live:
-                    while True:
-                        msg_type, item = spec_queue.get()
-                        if msg_type == "done":
-                            break
-                        if msg_type == "error":
-                            raise item
-                        chunk = item
-                        if chunk.choices and len(chunk.choices) > 0:
-                            content = chunk.choices[0].delta.content or ""
-                            if content:
-                                if first_token_time is None:
-                                    first_token_time = spec_meta["first_token_time"] or time.perf_counter()
-                                full_response += content
-                                if use_thinking:
-                                    prog_streamer.step(live, format_thinking_markdown(full_response))
-                                else:
-                                    cleaned_live = strip_thinking_and_dedup(full_response)
-                                    if cleaned_live:
-                                        prog_streamer.step(live, cleaned_live)
-                                    elif is_quant_query:
-                                        live.update(
-                                            prog_streamer.make_status_line(
-                                                "Calculating intermediate equations...",
-                                                prefix_label="⚡ Reasoning",
-                                            )
-                                        )
-                        if hasattr(chunk, "usage") and chunk.usage:
-                            completion_tokens = chunk.usage.completion_tokens
-                final_disp = (
-                    format_thinking_markdown(full_response)
-                    if use_thinking
-                    else strip_thinking_and_dedup(full_response)
-                )
-                prog_streamer.finish(final_disp)
-                end_time = time.perf_counter()
-            else:
-                start_time = time.perf_counter()
-                first_token_time = None
-                stream_kwargs = {
-                    "model": MODEL_NAME,
-                    "messages": active_payload,
-                    "temperature": 0.6 if effective_thinking else 0.7,
-                    "max_tokens": MODEL_PROFILE["max_gen_tokens"],
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                }
-                if extra_body_params:
-                    stream_kwargs["extra_body"] = extra_body_params
+            start_time = time.perf_counter()
+            first_token_time = None
+            stream_kwargs = {
+                "model": MODEL_NAME,
+                "messages": active_payload,
+                "temperature": 0.6 if effective_thinking else 0.7,
+                "max_tokens": MODEL_PROFILE["max_gen_tokens"],
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+            if extra_body_params:
+                stream_kwargs["extra_body"] = extra_body_params
 
-                stream = client.chat.completions.create(**stream_kwargs)
+            stream = client.chat.completions.create(**stream_kwargs)
 
-                with Live(
-                    prog_streamer.make_status_line(""),
-                    console=console,
-                    refresh_per_second=8,
-                    transient=True,
-                ) as live:
-                    for chunk in stream:
-                        if chunk.choices and len(chunk.choices) > 0:
-                            content = chunk.choices[0].delta.content or ""
-                            if content:
-                                if first_token_time is None:
-                                    first_token_time = time.perf_counter()
-                                full_response += content
-                                if use_thinking:
-                                    prog_streamer.step(live, format_thinking_markdown(full_response))
-                                else:
-                                    cleaned_live = strip_thinking_and_dedup(full_response)
-                                    if cleaned_live:
-                                        prog_streamer.step(live, cleaned_live)
-                                    elif is_quant_query:
-                                        live.update(
-                                            prog_streamer.make_status_line(
-                                                "Calculating intermediate equations...",
-                                                prefix_label="⚡ Reasoning",
-                                            )
-                                        )
+            with Live(
+                prog_streamer.make_status_line(""),
+                console=console,
+                refresh_per_second=8,
+                transient=True,
+            ) as live:
+                for chunk in stream:
+                    if chunk.choices and len(chunk.choices) > 0:
+                        content = chunk.choices[0].delta.content or ""
+                        if content:
+                            if first_token_time is None:
+                                first_token_time = time.perf_counter()
+                            full_response += content
+                            if use_thinking:
+                                prog_streamer.step(live, format_thinking_markdown(full_response))
+                            elif (
+                                effective_thinking
+                                and MODEL_PROFILE["mode"] in ("deepseek_qwen3_bridge", "native_think")
+                                and not (DS_THINK_CLOSE_STR in full_response or "</think>" in full_response)
+                            ):
+                                live.update(
+                                    prog_streamer.make_status_line(
+                                        "Calculating intermediate equations...",
+                                        prefix_label="⚡ Reasoning",
+                                    )
+                                )
+                            else:
+                                cleaned_live = strip_thinking_and_dedup(full_response)
+                                if cleaned_live:
+                                    prog_streamer.step(live, cleaned_live)
 
-                        if hasattr(chunk, "usage") and chunk.usage:
-                            completion_tokens = chunk.usage.completion_tokens
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        completion_tokens = chunk.usage.completion_tokens
 
-                final_disp = (
-                    format_thinking_markdown(full_response)
-                    if use_thinking
-                    else strip_thinking_and_dedup(full_response)
-                )
-                prog_streamer.finish(final_disp)
-                end_time = time.perf_counter()
+            final_disp = (
+                format_thinking_markdown(full_response)
+                if use_thinking
+                else strip_thinking_and_dedup(full_response)
+            )
+            prog_streamer.finish(final_disp)
+            end_time = time.perf_counter()
 
             if completion_tokens == 0 and full_response:
                 completion_tokens = max(1, int(len(full_response) / 4))

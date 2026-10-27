@@ -145,16 +145,12 @@ To verify that extending the verbatim window to `MAX_PAIRS = 30` (`~18.6K` token
 
 * **Total Multi-Needle Recall Score:** **`12 / 12 (100.0%)`** across all conversation depths (`7%` through `97%`) with zero attention dilution.
 
-#### G. Automatic Multi-Slot Concurrency Acceleration (Speculative Router Racing & Section-Parallel Map-Reduce)
+#### G. Automatic Multi-Slot Concurrency Acceleration (Section-Parallel Map-Reduce Generation)
 Because LLM decode on both **Tenstorrent QuietBox 2 (`P300X2`, 32 slots)** and **NVIDIA DGX Spark (`GB10`, 128+ slots)** is memory-bandwidth bound at `batch = 1`, `vLLM` continuous batching can decode multiple concurrent streams in a single forward pass by reading the 32B model weights from memory once per step. [`cjllm.py`](./cjllm.py) exploits those parallel slots **100% automatically with zero slash commands**:
 
-1. **Automatic Speculative Router + Direct-Answer Racing (`race_router_and_speculative_stream`):**
-   * On every standard prompt, [`cjllm.py`](./cjllm.py) fires **Slot 1 (`determine_search_query`)** and **Slot 2 (Speculative Direct Answer Stream)** at the exact same millisecond (`t = 0`).
-   * Whenever Slot 1 returns `None` (no web search needed), Slot 2 has **already completed prefill and begun streaming tokens** while the router was evaluating — hiding 100% of the search-router latency (`0.0 ms` post-router wait).
-   * Whenever Slot 1 returns a search query, Slot 2 is aborted/closed in `< 1 ms`, freeing the server slot immediately before web retrieval begins.
-2. **Automatic Section-Parallel / Map-Reduce Generation (`plan_parallel_sections` + `stream_parallel_sections`):**
-   * Automatically detects when a prompt naturally decomposes into 3–5 independent parallel sections (such as `1) ... 2) ... 3) ...` numbered sub-tasks, comparing $\ge 3$ stock tickers like *"Compare NVDA, AAPL, and AMD today"*, comma-separated multi-topic explanations like *"Explain NoC routing, Paged KV caching, RoPE embeddings, and SwiGLU activations"*, or comprehensive deep-dive requests).
-   * Launches **all $N$ section streams simultaneously** with a 99%-identical prompt prefix (maximizing `vLLM` KV prefix caching across all $N$ slots) and renders all $N$ sections growing in parallel in the terminal, achieving **`3.5×` to `4.2×` higher single-user throughput (`~58–75+ tok/s`)**.
+* **Automatic Section-Parallel / Map-Reduce Generation (`plan_parallel_sections` + `stream_parallel_sections`):**
+  * Automatically detects when a prompt naturally decomposes into 3–5 independent parallel sections (such as `1) ... 2) ... 3) ...` numbered sub-tasks, comparing $\ge 3$ stock tickers like *"Compare NVDA, AAPL, and AMD today"*, comma-separated multi-topic explanations like *"Explain NoC routing, Paged KV caching, RoPE embeddings, and SwiGLU activations"*, or comprehensive deep-dive requests).
+  * Runs **after** live web search retrieval so every parallel slot receives the full 2026 web-grounded context, launches **all $N$ section streams simultaneously** with a 99%-identical prompt prefix (maximizing `vLLM` KV prefix caching across all $N$ slots), and progressively commits completed sections to the terminal scrollback buffer, achieving **`3.5×` to `4.2×` higher single-user throughput (`~58–75+ tok/s`)**.
 
 ##### QuietBox 2 (`P300X2`, 4× Blackhole) 32-Stream Continuous-Batching Benchmark (`DeepSeek-R1-Distill-Qwen-32B`)
 | Simultaneous Streams | Total Output Tokens | Total Wall-Clock Time | TTFT (`min / avg / max`) | Per-Stream Decode Speed | Aggregate Decode Throughput | Net Wall-Clock Throughput | Scaling vs. 1 Stream |
