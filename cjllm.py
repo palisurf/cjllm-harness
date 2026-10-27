@@ -700,7 +700,7 @@ def fetch_yahoo_rich_cards(query: str) -> list[str]:
     return cards
 
 
-def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", max_chars: int = 2800) -> str:
+def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", max_chars: int = 3800) -> str:
     """
     Two-pass structured webpage extractor using `primp`:
       - Pass 1 (Tabular Priority): Scans up to 4 candidate URLs (including auto-resolved
@@ -762,21 +762,26 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", m
             if resp.status_code != 200 or not resp.text:
                 continue
             raw = resp.text
-            for tag in ("script", "style", "svg", "noscript", "header", "footer", "nav"):
+            for tag in ("script", "style", "svg", "noscript", "header", "footer", "nav", "sup"):
                 raw = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", " ", raw, flags=re.S | re.I)
+            # Strip MediaWiki data-mw JSON attributes (which can contain '>' characters that break tag stripping)
+            raw = re.sub(r"\sdata-mw='[^']*'", "", raw)
+            raw = re.sub(r'\sdata-mw="[^"]*"', "", raw)
 
             # Pass 1: Extract structured HTML <table> rows across up to 6 tables per page
-            tables = re.findall(r"<table[^>]*>(.*?)</table>", raw, flags=re.S | re.I)
+            tables = re.findall(r"<table([^>]*)>(.*?)</table>", raw, flags=re.S | re.I)
             if tables:
                 rows_out = []
-                for tbl in tables[:6]:
-                    tbl_rows = 0
+                for tbl_attrs, tbl in tables[:8]:
+                    if re.search(r"\b(navbox|ambox|mbox|metadata|sistersitebox|toc)\b", tbl_attrs, flags=re.I):
+                        continue
+                    tbl_rows_list = []
                     for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, flags=re.S | re.I):
                         cells = [
                             clean_text(re.sub(r"<[^>]+>", " ", cell))
                             for cell in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, flags=re.S | re.I)
                         ]
-                        cells = [c for c in cells if c]
+                        cells = [c for c in cells if c and not c.startswith("#") and "DCDCDC" not in c]
                         if len(cells) >= 2:
                             row_line = " | ".join(cells)
                             if any(
@@ -784,14 +789,34 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", m
                                 for skip_phrase in ("Unit of Measure:", "Change units", "Click on the graph")
                             ):
                                 continue
-                            rows_out.append(row_line)
-                            tbl_rows += 1
-                        if tbl_rows >= 10 or len(rows_out) >= 40:
+                            tbl_rows_list.append(row_line)
+                        if len(tbl_rows_list) >= 120:
                             break
-                    if len(rows_out) >= 40:
+                    # Keep both head (top rankings) and tail (latest entries in chronological tables like US Presidents)
+                    if len(tbl_rows_list) > 20:
+                        selected_rows = (
+                            tbl_rows_list[:8]
+                            + ["... [Earlier/middle rows omitted] ..."]
+                            + tbl_rows_list[-12:]
+                        )
+                    else:
+                        selected_rows = tbl_rows_list[:20]
+                    rows_out.extend(selected_rows)
+                    # Stop once we have captured a substantial primary data/chronological table on this page
+                    if len(tbl_rows_list) >= 15 or len(rows_out) >= 45:
                         break
                 if len(rows_out) >= 3:
-                    table_text = "\n".join(rows_out)[: max_chars // 2 if extracted_blocks else max_chars]
+                    char_limit = max_chars // 2 if extracted_blocks else max_chars
+                    full_table_text = "\n".join(rows_out)
+                    if len(full_table_text) > char_limit:
+                        half = (char_limit - 40) // 2
+                        table_text = (
+                            full_table_text[:half]
+                            + "\n... [Middle table content omitted] ...\n"
+                            + full_table_text[-half:]
+                        )
+                    else:
+                        table_text = full_table_text
                     extracted_blocks.append(f"[Live Extracted Table from {url}]\n{table_text}")
                     if len(extracted_blocks) >= 2:
                         break
@@ -934,6 +959,18 @@ def fetch_web_context(
         except Exception:
             text_results = []
 
+        # If DDGS returns empty when a year suffix (e.g. '2026') is attached, retry without the trailing year
+        if len(text_results) < 2 and re.search(r"\b202\d\b", query):
+            stripped_q = re.sub(r"\b202\d\b", "", query).strip()
+            if stripped_q:
+                try:
+                    extra_res = list(ddgs_client.text(stripped_q, max_results=max_results))
+                    for er in extra_res:
+                        if all(er.get("href") != tr.get("href") for tr in text_results):
+                            text_results.append(er)
+                except Exception:
+                    pass
+
         try:
             news_results = list(ddgs_client.news(query, max_results=3))
         except Exception:
@@ -1008,20 +1045,51 @@ def fetch_web_context(
         return f"Failed to retrieve web search context: {e}"
 
 
+def requires_post_cutoff_search(user_input: str) -> bool:
+    """
+    Detects queries about time-sensitive officeholders, political leaders, CEOs, champions,
+    or 'last N / current / latest' sequences that can change after the model's 2024 pre-training
+    cutoff and therefore MUST trigger a live web search.
+    """
+    u_lower = user_input.lower().strip()
+    if is_clock_skill_query(user_input) and not is_external_data_query(user_input):
+        return False
+    office_or_title_pat = (
+        r"\b(president|presidents|vice\s+president|prime\s+minister|governor|mayor|senator|speaker|"
+        r"chancellor|pope|monarch|king|queen|ceo|cfo|chairman|fed\s+chair|secretary\s+of|administration|"
+        r"champion|champions|winner|winners|super\s+bowl|world\s+series|world\s+cup|nba\s+finals|"
+        r"stanley\s+cup|olympics|richest|most\s+valuable|largest\s+market\s+cap)\b"
+    )
+    temporal_qualifier_pat = (
+        r"\b(current|currently|present|incumbent|now|today|latest|recent|most\s+recent|"
+        r"last\s+\d+|past\s+\d+|who\s+is\s+the|who\s+are\s+the|2025|2026)\b"
+    )
+    return bool(re.search(office_or_title_pat, u_lower) and re.search(temporal_qualifier_pat, u_lower))
+
+
 def determine_search_query(user_input: str, history: list) -> str | None:
     """
     Fast, context-aware classification pass:
     - Deterministically skips pure coding/math/physics prompts that don't request live external lookup.
+    - Enforces post-2024 cutoff verification for current/recent officeholders, presidents, CEOs, and champions.
     - Injects today's system date so 'current'/'today'/'latest' queries use the real year (not training cutoff).
     - Uses up to the last 3 conversation turn pairs (600 chars/turn) + extracted station/ticker IDs
       to resolve multi-hop pronouns ('that buoy', 'the second one', 'their', 'it').
     - Automatically adapts to the active MODEL_PROFILE (skipping CoT when supported).
     """
     u_lower = user_input.lower().strip()
+    must_search_post_cutoff = requires_post_cutoff_search(user_input)
 
     # Fast deterministic guard: pure clock/date/day-of-week queries are answered by the built-in Current Time Skill
     if is_clock_skill_query(user_input) and not is_external_data_query(user_input):
         return None
+
+    # Fast deterministic route for US President queries (avoids LLM router hallucinating pre-2025 officeholders into the query)
+    if must_search_post_cutoff and re.search(r"\bpresidents?\b", u_lower) and not re.search(
+        r"\b(france|french|mexico|mexican|russia|russian|china|chinese|ukraine|ukrainian|brazil|brazilian|iran|iranian|korea|korean|taiwan|india|indian|argentina|turkey|turkish|poland|polish|philippines|indonesia|south\s+africa|nigeria|egypt|colombia|venezuela|company|university|college|bank|fed|federal\s+reserve|senate|council|board|club)\b",
+        u_lower,
+    ):
+        return "List of presidents of the United States Wikipedia"
 
     # Fast deterministic guard against pure coding / math / textbook physics false positives
     is_pure_code_or_math = (
@@ -1074,11 +1142,12 @@ def determine_search_query(user_input: str, history: list) -> str | None:
                     f"You are a search intent evaluator. Today's date is {today_str}.\n"
                     "Determine if the Latest User Prompt requires real-time web search data, "
                     "stock prices, financial quotes, rankings/tables, recent news, current weather, surf/swell/tide/buoy reports, specific URLs/repositories, product availability, or external specs.\n"
+                    f"- CRITICAL CUTOFF RULE: Your internal pre-training knowledge ended in 2024, whereas today is {today_str}. NEVER return 'NONE' for any question about current, incumbent, present, latest, or 'last N' political leaders, presidents ('who is the current president', 'last 5 presidents'), prime ministers, governors, CEOs, sports champions, award winners, or events that could have changed since 2024 — EVEN IF a previous turn in Recent Conversation Context already stated an answer! When 'president' is asked without a country, assume 'United States' (e.g. 'list of Presidents of the United States').\n"
                     "- Use Recent Conversation Context to resolve pronouns, implicit topic references (e.g., 'for today only instead', 'that buoy', 'the second one'), or when previous turns failed to provide the requested data.\n"
                     "- When Recent Conversation Context contains a specific 5-digit NOAA buoy station ID (e.g., 46221, 46054, 46218) that matches the buoy referenced by the user, ALWAYS include that exact 5-digit station ID (e.g. 'NOAA buoy 46054 wave height water temp') in your search query.\n"
                     f"- When the user asks for 'current', 'latest', or 'today', use the current date/year ({today_str}) in your search query (NEVER use 2023 or 2024).\n"
                     "- If the user asks to pull data, search, update, verify, or narrow a previous real-time data request (such as 'for today only instead'), ALWAYS output a search query combining the topic from Recent Conversation Context with the Latest User Prompt.\n"
-                    "- If search IS NOT needed (math, coding, reasoning, established general knowledge, or follow-up analysis of facts already stated), reply ONLY with 'NONE'.\n"
+                    "- If search IS NOT needed (pure math, coding, abstract reasoning, or timeless pre-2024 historical/scientific facts), reply ONLY with 'NONE'.\n"
                     "- If search IS needed, reply ONLY with a concise 2-10 word web search query (NO explanations or preamble)."
                 ),
             },
@@ -1110,24 +1179,38 @@ def determine_search_query(user_input: str, history: list) -> str | None:
         res_text = lines[-1] if lines else ""
 
         if not res_text or res_text.upper().startswith("NONE") or res_text.upper() == "NONE":
+            if must_search_post_cutoff:
+                if "president" in u_lower and any(x in u_lower for x in ("usa", "u.s", "united states", "current", "last")):
+                    return "list of Presidents of the United States Wikipedia"
+                return f"{user_input} {datetime.now(LOCAL_TZ).year}"
             return None
 
-        # Guard against leaked reasoning sentences being sent to DuckDuckGo
+        # Guard against leaked reasoning sentences or declarative answers ("The current ... is ...") being sent to DuckDuckGo
         lower_q = res_text.lower()
-        if len(res_text.split()) > 12 or any(
+        is_declarative_answer = bool(
+            re.match(r"^the\s+(current|last|latest|present)\b.*\b(is|are|was|were)\b", lower_q)
+            or res_text.endswith(".")
+        )
+        if is_declarative_answer or len(res_text.split()) > 12 or any(
             phrase in lower_q
             for phrase in ("to determine", "i'll analyze", "i will analyze", "the user is asking", "user's request")
         ):
             cleaned_fallback = re.sub(
-                r"\b(show me|the|with|for|create|a|table|this|please|format|in|go|and|pull|information|from|publically|available|data|on)\b",
+                r"\b(show me|who|is|are|was|were|the|with|for|create|a|table|this|please|format|in|go|and|pull|information|from|publically|available|data|on)\b",
                 " ",
                 user_input,
                 flags=re.I,
             )
             cleaned_fallback = re.sub(r"\s+", " ", cleaned_fallback).strip()
-            res_text = cleaned_fallback[:80] if cleaned_fallback else user_input[:80]
+            res_text = f"{cleaned_fallback} {datetime.now(LOCAL_TZ).year}".strip()[:80] if cleaned_fallback else user_input[:80]
 
         res_text = res_text.replace('"', "").replace("'", "")
+
+        # Ensure generic "president" queries default to United States President rather than film/book titles
+        if "president" in u_lower and not any(
+            c in res_text.lower() for c in ("united states", "u.s", "usa", "france", "mexico", "russia", "china", "ukraine", "brazil", "iran", "korea", "taiwan")
+        ):
+            res_text = f"United States {res_text}"
 
         # Post-processing: if query is about a buoy from recent context but lacks the 5-digit ID, attach the matching ID
         if recent_buoy_matches and "buoy" in res_text.lower() and not re.search(r"\b\d{5}\b", res_text):
@@ -1266,6 +1349,10 @@ def race_router_and_speculative_stream(
     ):
         # Deterministic direct query: no router LLM call needed at all
         return None, None, None
+
+    # If the prompt deterministically requires post-2024 cutoff verification, skip speculative direct stream
+    if requires_post_cutoff_search(user_input):
+        return determine_search_query(user_input, history), None, None
 
     spec_queue: queue.Queue = queue.Queue()
     abort_event = threading.Event()
@@ -1804,7 +1891,7 @@ while True:
             continue
 
         # Terminal Termination Handling
-        if user_input.lower() in ["chat_end", "exit", "quit"]:
+        if user_input.lower() in ["chat_end", "exit", "quit", "/exit", "/quit"]:
             console.print(f"\n[bold yellow][Ending Session][/bold yellow] De-hydrating cache to '{DEFAULT_CACHE_FILE}'...")
             de_hydrate_cache(conversation_history, summary_buffer, DEFAULT_CACHE_FILE)
             save_cmd_history()
@@ -1947,8 +2034,11 @@ while True:
             active_user_content = (
                 f"{skill_prefix}{web_payload}\n"
                 "### INSTRUCTIONS:\n"
-                "Answer the Active User Request below using the live data above where relevant, "
-                f"while maintaining continuity with our recent conversation history.{quant_instruction}\n\n"
+                f"Today's date is {CURRENT_DATE_STR}. Your internal pre-training knowledge ended in 2024.\n"
+                "- Answer the Active User Request below using the live web search data and extracted tables above.\n"
+                "- CRITICAL: Chronological tables (such as lists of Presidents, leaders, or champions) list the oldest entries at the top and the MOST RECENT / INCUMBENT entries (2025–2026) at the bottom. Always check the bottom rows (e.g., #47 / 'Incumbent' / 2025–present) and override both your 2024 pre-training memory AND any stale earlier conversation turns with the 2025–2026 facts in the table!\n"
+                "- When asked for the 'last N' or 'most recent N' presidents, leaders, or winners, list them in reverse chronological order starting from the current 2025–2026 incumbent at the bottom of the table (e.g., for last 5 US Presidents: start at #47 Donald Trump [2025–Incumbent], #46 Joe Biden [2021–2025], #45 Donald Trump [2017–2021], #44 Barack Obama [2009–2017], #43 George W. Bush [2001–2009], and #42 Bill Clinton [1993–2001] so both the last 5 presidencies and last 5 distinct individuals are clear)."
+                f"{quant_instruction}\n\n"
                 f"### ACTIVE USER REQUEST:\n{user_input}"
             )
         else:
