@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+*.swp
+.chat_prompt_history
+chat_cache.json
