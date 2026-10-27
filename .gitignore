@@ -3,3 +3,5 @@ __pycache__/
 *.swp
 .chat_prompt_history
 chat_cache.json
+PRIVATE_*.md
+AGENT.md

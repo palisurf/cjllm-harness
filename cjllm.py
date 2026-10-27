@@ -469,12 +469,70 @@ def _extract_yahoo_stock_card(html_text: str, label: str = "") -> list[str]:
     return out
 
 
+def _extract_yahoo_weather_card(html_text: str, label: str = "") -> list[str]:
+    """Helper to parse Yahoo Search compWeatherInfo / weatherCarousel blocks from raw HTML."""
+    weather_parts = []
+    prefix = f"[Live Weather & Multi-Day Forecast Card — {label}]" if label else "[Live Weather & Multi-Day Forecast Card]"
+    for m in re.finditer(r'class="[^"]*compWeatherInfo[^"]*"', html_text):
+        idx = m.start()
+        chunk = html_text[idx : idx + 35000]
+        chunk = re.sub(r"data-forecast='[^']*'", "", chunk)
+        chunk = re.sub(r'data-forecast="[^"]*"', "", chunk)
+        chunk = re.sub(r"data-yga='[^']*'", "", chunk)
+        chunk = re.sub(r"<svg[^>]*>.*?<title[^>]*>(.*?)</title>.*?</svg>", r" (\1) ", chunk, flags=re.S)
+        chunk = re.sub(r"<svg[^>]*>.*?</svg>", " ", chunk, flags=re.S)
+        chunk = re.sub(r"<style[^>]*>.*?</style>", " ", chunk, flags=re.S)
+        chunk = re.sub(r"<script[^>]*>.*?</script>", " ", chunk, flags=re.S)
+        chunk = re.sub(r"^[^<]*>", " ", chunk)
+        chunk = re.sub(r"<[^>]*$", " ", chunk)
+        w_txt = clean_text(re.sub(r"<[^>]+>", " ", chunk))
+        for stop_marker in ["Temperature Precipitation Wind", "People also search", "Explore AI results"]:
+            if stop_marker in w_txt:
+                w_txt = w_txt.split(stop_marker)[0].strip()
+        if len(w_txt) > 20:
+            weather_parts.append(w_txt[:500])
+    if weather_parts:
+        return [f"{prefix} " + " | Forecast: ".join(weather_parts[:2])]
+    return []
+
+
+_TICKER_STOPWORDS = {
+    "THE", "AND", "FOR", "WITH", "FROM", "THAT", "THIS", "WHAT", "WHEN", "WHERE", "WHICH",
+    "HOW", "WHY", "WHO", "ARE", "WAS", "WERE", "TODAY", "NOW", "LIVE", "DATA", "PRICE",
+    "STOCK", "QUOTE", "INDEX", "MARKET", "CAP", "PE", "EPS", "ETF", "IPO", "CEO", "CFO",
+    "GDP", "CPI", "FED", "SEC", "NYSE", "NASDAQ", "DOW", "DJIA", "SP", "USD", "USA", "US",
+    "UK", "EU", "NOAA", "NDBC", "UTC", "GMT", "PDT", "PST", "EDT", "EST", "CDT", "CST",
+    "VS", "OR", "IN", "ON", "AT", "TO", "OF", "BY", "ALL", "TOP", "NEW", "HIGH", "LOW",
+    "CA", "HI", "NY", "TX", "FL", "WA", "OR", "AZ", "NV", "CO", "MA", "IL", "PA", "OH",
+}
+
+_KNOWN_COMPANY_TICKERS = {
+    "nvidia": ("NVDA", "NVDA stock quote"),
+    "apple": ("AAPL", "AAPL stock quote"),
+    "microsoft": ("MSFT", "MSFT stock quote"),
+    "amd": ("AMD", "AMD stock quote"),
+    "broadcom": ("AVGO", "AVGO stock quote"),
+    "alphabet": ("GOOGL", "GOOGL stock quote"),
+    "google": ("GOOGL", "GOOGL stock quote"),
+    "amazon": ("AMZN", "AMZN stock quote"),
+    "meta": ("META", "META stock quote"),
+    "tesla": ("TSLA", "TSLA stock quote"),
+    "intel": ("INTC", "INTC stock quote"),
+    "tsmc": ("TSM", "TSM stock quote"),
+    "micron": ("MU", "MU stock quote"),
+    "palantir": ("PLTR", "PLTR stock quote"),
+    "generac": ("GNRC", "GNRC stock quote"),
+}
+
+
 def fetch_yahoo_rich_cards(query: str) -> list[str]:
     """
-    Extracts rich top-of-page Yahoo Search cards (such as live stock/market quotes
-    and structured fact tables) that DDGS().text() skips when parsing organic links.
-    Automatically expands multi-index queries (Dow, S&P 500, Nasdaq) so all requested
-    indices receive live quote cards.
+    Extracts rich top-of-page Yahoo Search cards (live stock/index/crypto/commodity quotes,
+    multi-city weather forecasts, and structured fact tables) that DDGS().text() skips.
+    Automatically expands:
+      - Multi-index / macro queries (Dow, S&P 500, Nasdaq, Russell 2000, Bitcoin, Gold, 10Y Treasury)
+      - Multi-ticker stock comparisons (e.g., 'NVDA AAPL AMD stock price today')
+      - Multi-location weather comparisons (e.g., 'weather Malibu CA vs Honolulu HI')
     """
     cards = []
     if primp is None:
@@ -484,17 +542,50 @@ def fetch_yahoo_rich_cards(query: str) -> list[str]:
         http_client = primp.Client(impersonate="random", timeout=5)
         q_lower = query.lower()
 
-        # Check if query asks for multiple major US stock indices at once
-        index_targets = []
-        if re.search(r"\b(dow|djia|dji)\b", q_lower):
-            index_targets.append(("Dow Jones Industrial Average", "Dow Jones Industrial Average quote"))
-        if re.search(r"\b(s&p|sp\s*500|s\s*p\s*500|\bsp\b)\b", q_lower):
-            index_targets.append(("S&P 500", "S&P 500 index quote"))
-        if re.search(r"\b(nasdaq|ixic)\b", q_lower):
-            index_targets.append(("Nasdaq Composite", "Nasdaq Composite quote"))
+        # 1. Check for multi-index, macro-asset, or multi-ticker financial queries
+        finance_targets: list[tuple[str, str]] = []
+        seen_labels: set[str] = set()
 
-        if len(index_targets) >= 2:
-            for idx_label, idx_query in index_targets:
+        def _add_fin_target(lbl: str, q_str: str):
+            if lbl not in seen_labels:
+                seen_labels.add(lbl)
+                finance_targets.append((lbl, q_str))
+
+        if re.search(r"\b(dow|djia|dji)\b", q_lower):
+            _add_fin_target("Dow Jones (^DJI)", "Dow Jones Industrial Average quote")
+        if re.search(r"\b(s&p|sp\s*500|s\s*p\s*500|\bsp\b|gspc)\b", q_lower):
+            _add_fin_target("S&P 500 (^GSPC)", "S&P 500 index quote")
+        if re.search(r"\b(nasdaq|ixic)\b", q_lower):
+            _add_fin_target("Nasdaq Composite (^IXIC)", "Nasdaq Composite quote")
+        if re.search(r"\b(russell\s*2000|rut)\b", q_lower):
+            _add_fin_target("Russell 2000 (^RUT)", "Russell 2000 index quote")
+        if re.search(r"\b(bitcoin|btc)\b", q_lower):
+            _add_fin_target("Bitcoin (BTC-USD)", "BTC-USD price quote")
+        if re.search(r"\b(ethereum|eth)\b", q_lower):
+            _add_fin_target("Ethereum (ETH-USD)", "ETH-USD price quote")
+        if re.search(r"\b(gold\s+price|gold\s+futures|\bgold\b)\b", q_lower) and any(
+            k in q_lower for k in ("price", "quote", "move", "today", "market", "bitcoin", "treasury", "yield", "oil", "silver")
+        ):
+            _add_fin_target("Gold (GC=F)", "Gold futures GC=F quote")
+        if re.search(r"\b(10[-\s]*year\s+treasury|10y\s+yield|treasury\s+yield|tnx)\b", q_lower):
+            _add_fin_target("10-Year Treasury Yield (^TNX)", "^TNX 10 year treasury yield quote")
+
+        # Detect explicit uppercase stock tickers (e.g., NVDA, AAPL, AMD) or known company names
+        has_fin_context = any(
+            w in q_lower
+            for w in ("stock", "price", "quote", "share", "market", "cap", "pe", "ticker", "compare", "today", "earnings", "close")
+        )
+        for comp_name, (tk, tk_q) in _KNOWN_COMPANY_TICKERS.items():
+            if re.search(rf"\b{comp_name}\b", q_lower):
+                _add_fin_target(tk, tk_q)
+
+        if has_fin_context:
+            for tk in re.findall(r"\b([A-Z]{2,5})\b", query):
+                if tk not in _TICKER_STOPWORDS:
+                    _add_fin_target(tk, f"{tk} stock quote")
+
+        if len(finance_targets) >= 2:
+            for idx_label, idx_query in finance_targets[:5]:
                 try:
                     r_idx = http_client.get(f"https://search.yahoo.com/search?p={quote_plus(idx_query)}")
                     if r_idx.status_code == 200 and r_idx.text:
@@ -502,38 +593,46 @@ def fetch_yahoo_rich_cards(query: str) -> list[str]:
                 except Exception:
                     pass
 
+        # 2. Check for multi-location weather comparison queries (e.g. "weather Malibu CA vs Honolulu HI")
+        weather_cards: list[str] = []
+        if any(w in q_lower for w in ("weather", "forecast", "temperature")):
+            loc_cleaned = re.sub(
+                r"\b(compare|current|weather|forecast|temperature|in|for|between|today|right now|3-day|5-day|7-day|what|is|the)\b",
+                " ",
+                query,
+                flags=re.I,
+            )
+            loc_parts = [
+                p.strip(" ,.;:?!-")
+                or ""
+                for p in re.split(r"\b(?:vs\.?|versus|and|compared\s+to|or)\b|;", loc_cleaned, flags=re.I)
+            ]
+            loc_parts = [re.sub(r"\s+", " ", p).strip() for p in loc_parts if len(p.strip()) >= 3]
+            if len(loc_parts) >= 2:
+                for loc in loc_parts[:3]:
+                    try:
+                        r_w = http_client.get(f"https://search.yahoo.com/search?p={quote_plus('weather ' + loc)}")
+                        if r_w.status_code == 200 and r_w.text:
+                            weather_cards.extend(_extract_yahoo_weather_card(r_w.text, label=loc))
+                    except Exception:
+                        pass
+
         url = f"https://search.yahoo.com/search?p={quote_plus(query)}"
         resp = http_client.get(url)
         if resp.status_code != 200 or not resp.text:
+            cards.extend(weather_cards)
             return cards
         html_text = resp.text
 
-        # 1. Live Finance / Market Quote Card (if not already populated by multi-index expansion)
+        # Single-target fallback for Finance Quote Card
         if not cards:
             cards.extend(_extract_yahoo_stock_card(html_text))
 
-        # 2. Live Weather & 7/10-Day Forecast Card (compWeatherInfo / weatherCarousel dailies)
-        weather_parts = []
-        for m in re.finditer(r'class="[^"]*compWeatherInfo[^"]*"', html_text):
-            idx = m.start()
-            chunk = html_text[idx : idx + 35000]
-            chunk = re.sub(r"data-forecast='[^']*'", "", chunk)
-            chunk = re.sub(r'data-forecast="[^"]*"', "", chunk)
-            chunk = re.sub(r"data-yga='[^']*'", "", chunk)
-            chunk = re.sub(r"<svg[^>]*>.*?<title[^>]*>(.*?)</title>.*?</svg>", r" (\1) ", chunk, flags=re.S)
-            chunk = re.sub(r"<svg[^>]*>.*?</svg>", " ", chunk, flags=re.S)
-            chunk = re.sub(r"<style[^>]*>.*?</style>", " ", chunk, flags=re.S)
-            chunk = re.sub(r"<script[^>]*>.*?</script>", " ", chunk, flags=re.S)
-            chunk = re.sub(r"^[^<]*>", " ", chunk)
-            chunk = re.sub(r"<[^>]*$", " ", chunk)
-            w_txt = clean_text(re.sub(r"<[^>]+>", " ", chunk))
-            for stop_marker in ["Temperature Precipitation Wind", "People also search", "Explore AI results"]:
-                if stop_marker in w_txt:
-                    w_txt = w_txt.split(stop_marker)[0].strip()
-            if len(w_txt) > 20:
-                weather_parts.append(w_txt[:500])
-        if weather_parts:
-            cards.append("[Live Weather & Multi-Day Forecast Card] " + " | Forecast: ".join(weather_parts[:2]))
+        # Single-target fallback for Weather Card
+        if weather_cards:
+            cards.extend(weather_cards)
+        else:
+            cards.extend(_extract_yahoo_weather_card(html_text))
 
         # 3. Structured Result Fact Tables (grp-talgo-facts)
         fact_blocks = []
@@ -549,14 +648,16 @@ def fetch_yahoo_rich_cards(query: str) -> list[str]:
     return cards
 
 
-def fetch_top_page_table_or_excerpt(text_results: list[dict], max_chars: int = 2800) -> str:
+def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", max_chars: int = 2800) -> str:
     """
-    Fetches the highest-priority organic result URLs using `primp` and extracts structured
-    HTML `<table>` rows across up to 6 tables per page (including NOAA NDBC buoy tables,
-    surf/swell/tide forecasts, and market rankings) so queries asking for tables or detailed
-    figures get actual page data rather than just a 1-sentence meta description.
+    Two-pass structured webpage extractor using `primp`:
+      - Pass 1 (Tabular Priority): Scans up to 4 candidate URLs (including auto-resolved
+        5-digit NOAA NDBC buoy station pages) for structured HTML `<table>` data across
+        up to 6 tables per page so a non-tabular rank-1 article never shadows a real table at rank 2-4.
+      - Pass 2 (Plain-Text Excerpt Fallback): If no candidate URL contains a valid HTML `<table>`,
+        extracts a cleaned article excerpt from the top reachable candidate.
     """
-    if primp is None or not text_results:
+    if primp is None or (not text_results and not query):
         return ""
 
     preferred_domains = (
@@ -579,27 +680,31 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], max_chars: int = 2
     )
     candidate_urls = []
 
-    # Automatically resolve NOAA NDBC 5-digit buoy station IDs mentioned in results (e.g., 46221)
-    for res in text_results:
-        combined_meta = f"{res.get('title', '')} {res.get('href', '')} {res.get('body', '')}"
-        if any(k in combined_meta.lower() for k in ("buoy", "ndbc", "noaa", "swell")):
-            for station_match in re.findall(r"\b(46\d{3}|41\d{3}|42\d{3}|44\d{3}|51\d{3})\b", combined_meta):
-                ndbc_url = f"https://www.ndbc.noaa.gov/station_page.php?station={station_match}"
-                if ndbc_url not in candidate_urls:
-                    candidate_urls.append(ndbc_url)
+    # Automatically resolve NOAA NDBC 5-digit buoy station IDs from query or search results (e.g., 46221, 46054)
+    all_meta_sources = [query] + [
+        f"{res.get('title', '')} {res.get('href', '')} {res.get('body', '')}" for res in (text_results or [])
+    ]
+    combined_all = " ".join(all_meta_sources)
+    if any(k in combined_all.lower() for k in ("buoy", "ndbc", "noaa", "swell", "station", "wave")):
+        for station_match in re.findall(r"\b(46\d{3}|41\d{3}|42\d{3}|44\d{3}|51\d{3})\b", combined_all):
+            ndbc_url = f"https://www.ndbc.noaa.gov/station_page.php?station={station_match}"
+            if ndbc_url not in candidate_urls:
+                candidate_urls.append(ndbc_url)
 
-    for res in text_results:
+    for res in text_results or []:
         href = res.get("href", "")
         if href and any(d in href for d in preferred_domains) and href not in candidate_urls:
             candidate_urls.append(href)
-    for res in text_results:
+    for res in text_results or []:
         href = res.get("href", "")
         if href and href not in candidate_urls:
             candidate_urls.append(href)
 
     http_client = primp.Client(impersonate="random", timeout=5)
     extracted_blocks = []
-    for url in candidate_urls[:3]:
+    fallback_excerpt = ""
+
+    for url in candidate_urls[:4]:
         try:
             resp = http_client.get(url)
             if resp.status_code != 200 or not resp.text:
@@ -608,7 +713,7 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], max_chars: int = 2
             for tag in ("script", "style", "svg", "noscript", "header", "footer", "nav"):
                 raw = re.sub(rf"<{tag}[^>]*>.*?</{tag}>", " ", raw, flags=re.S | re.I)
 
-            # Extract structured HTML <table> rows across up to 6 tables per page
+            # Pass 1: Extract structured HTML <table> rows across up to 6 tables per page
             tables = re.findall(r"<table[^>]*>(.*?)</table>", raw, flags=re.S | re.I)
             if tables:
                 rows_out = []
@@ -629,19 +734,27 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], max_chars: int = 2
                                 continue
                             rows_out.append(row_line)
                             tbl_rows += 1
-                        if tbl_rows >= 8 or len(rows_out) >= 35:
+                        if tbl_rows >= 10 or len(rows_out) >= 40:
                             break
-                    if len(rows_out) >= 35:
+                    if len(rows_out) >= 40:
                         break
                 if len(rows_out) >= 3:
                     table_text = "\n".join(rows_out)[: max_chars // 2 if extracted_blocks else max_chars]
                     extracted_blocks.append(f"[Live Extracted Table from {url}]\n{table_text}")
                     if len(extracted_blocks) >= 2:
                         break
+
+            # Record plain-text fallback from the first valid page in case no URL has a <table>
+            if not fallback_excerpt:
+                body_text = clean_text(re.sub(r"<[^>]+>", " ", raw))
+                if len(body_text) > 250 and not is_junk_snippet(body_text[:400]):
+                    fallback_excerpt = f"[Live Webpage Excerpt from {url}]\n{body_text[:1500]}"
         except Exception:
             continue
 
-    return "\n\n".join(extracted_blocks)[:max_chars] if extracted_blocks else ""
+    if extracted_blocks:
+        return "\n\n".join(extracted_blocks)[:max_chars]
+    return fallback_excerpt[:max_chars]
 
 
 def fetch_web_context(
@@ -672,7 +785,7 @@ def fetch_web_context(
         except Exception:
             news_results = []
 
-        table_excerpt = fetch_top_page_table_or_excerpt(text_results) if text_results else ""
+        table_excerpt = fetch_top_page_table_or_excerpt(text_results, query=query)
 
         if not rich_cards and not table_excerpt and not text_results and not news_results:
             return "No web search results found."
