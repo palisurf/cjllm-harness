@@ -700,7 +700,7 @@ def fetch_yahoo_rich_cards(query: str) -> list[str]:
     return cards
 
 
-def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", max_chars: int = 3800) -> str:
+def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", max_chars: int = 4500) -> str:
     """
     Two-pass structured webpage extractor using `primp`:
       - Pass 1 (Tabular Priority): Scans up to 4 candidate URLs (including auto-resolved
@@ -818,7 +818,7 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", m
                     else:
                         table_text = full_table_text
                     extracted_blocks.append(f"[Live Extracted Table from {url}]\n{table_text}")
-                    if len(extracted_blocks) >= 2:
+                    if len(extracted_blocks) >= 3:
                         break
 
             # Record plain-text fallback from the first valid page in case no URL has a <table>
@@ -1401,23 +1401,23 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
 
 def detect_auto_parallel_sections(user_input: str) -> list[str] | None:
     """
-    Automatically detects when a user prompt naturally decomposes into 3 to 6 independent parallel
+    Automatically detects when a user prompt naturally decomposes into 2 to 6 independent parallel
     sections without requiring any slash command:
-      1. Explicit numbered sub-questions: `1) ... 2) ... 3) ...`
-      2. Multi-ticker / multi-company comparisons (>= 3 tickers/companies)
-      3. Multi-topic comma-separated explanations (`Explain A, B, C, and D`)
+      1. Explicit numbered sub-questions: `1) ... 2) ...`
+      2. Multi-ticker / multi-company comparisons (>= 2 tickers/companies)
+      3. Multi-topic comma-separated explanations/lists (`Explain/List/Compare A, B, and C`)
     """
-    # 1. Explicit numbered sub-tasks: "1) ... 2) ... 3) ..."
+    # 1. Explicit numbered sub-tasks: "1) ... 2) ..."
     numbered = re.findall(
         r"(?:^|\s)(?:\d+[\)\.]\s*)([^0-9\n][^\n\?;]{6,120}?)(?=(?:\s+\d+[\)\.]\s+)|$)",
         user_input.strip(),
     )
-    if 3 <= len(numbered) <= 6:
+    if 2 <= len(numbered) <= 6:
         return [clean_text(item).rstrip(".,;") for item in numbered]
 
     u_lower = user_input.lower().strip()
 
-    # 2. Multi-ticker / multi-company comparison of >= 3 tickers
+    # 2. Multi-ticker / multi-company comparison of >= 2 tickers
     if re.search(r"\b(compare|comparison|analyze|breakdown|break\s+down|contrast|detailed|evaluate|outlook)\b", u_lower):
         tickers = []
         for tok in re.findall(r"\b[A-Z]{2,5}\b", user_input):
@@ -1426,19 +1426,19 @@ def detect_auto_parallel_sections(user_input: str) -> list[str] | None:
         for name_key, (sym, _) in _KNOWN_COMPANY_TICKERS.items():
             if re.search(rf"\b{re.escape(name_key)}\b", u_lower) and sym not in tickers:
                 tickers.append(sym)
-        if 3 <= len(tickers) <= 5:
+        if 2 <= len(tickers) <= 5:
             sections = [f"{sym} — Live Quote, Performance & Key Metrics Analysis" for sym in tickers]
             sections.append(f"Side-by-Side Comparison Table & Relative Summary ({', '.join(tickers)})")
             return sections
 
-    # 3. Comma-separated multi-topic explanations: "Explain/Describe/Compare A, B, C, and D"
+    # 3. Comma-separated multi-topic explanations/lists: "Explain/Describe/Compare/List A, B, and C"
     m_list = re.match(
-        r"^(?:please\s+)?(?:explain|describe|compare|detail|break\s+down|summarize)\s+(?:the\s+(?:differences\s+between|following\s+topics|concepts\s+of)\s*:?\s*)?(.+)$",
+        r"^(?:please\s+)?(?:explain|describe|compare|detail|break\s+down|summarize|list|show|tabulate)\s+(?:all\s+(?:of\s+)?(?:the\s+)?)?(?:the\s+(?:differences\s+between|following\s+topics|concepts\s+of)\s*:?\s*)?(.+)$",
         user_input.strip(),
         flags=re.I,
     )
     if m_list and "," in m_list.group(1):
-        tail = m_list.group(1).strip().rstrip(".?!")
+        tail = re.sub(r",?\s+in\s+a\s+table.*$", "", m_list.group(1).strip(), flags=re.I).rstrip(".?!")
         raw_items = re.split(r"\s*,\s*(?:and\s+)?|\s+and\s+", tail)
         clean_items = [it.strip() for it in raw_items if 4 <= len(it.strip()) <= 75 and len(it.strip().split()) <= 10]
         if 3 <= len(clean_items) <= 5:
@@ -1450,9 +1450,13 @@ def detect_auto_parallel_sections(user_input: str) -> list[str] | None:
 def plan_parallel_sections(user_input: str) -> list[str] | None:
     """
     Feature A — Automatic Section-Parallel / Map-Reduce Planner:
-    Automatically returns a list of 3-6 independent section titles when a prompt is a multi-part,
-    multi-entity, or comprehensive deep-dive request; returns `None` for normal single-stream prompts.
+    Automatically returns a list of 2-5 independent section titles when a prompt is a multi-part,
+    multi-entity ('X and Y'), exhaustive enumeration ('List all... in a table'), or comprehensive
+    deep-dive request; returns `None` for normal single-stream prompts.
     """
+    if is_search_opt_out_query(user_input):
+        return None
+
     auto_secs = detect_auto_parallel_sections(user_input)
     if auto_secs:
         return auto_secs
@@ -1464,7 +1468,21 @@ def plan_parallel_sections(user_input: str) -> list[str] | None:
             u_lower,
         )
     )
-    if not is_deep_dive:
+    is_multi_entity_or_exhaustive_table = bool(
+        re.search(
+            r"\b(list\s+all|all\s+of\s+the|every\s+named|complete\s+(?:list|table)|table\s+of\s+all)\b",
+            u_lower,
+        )
+        or (
+            re.search(r"\b(in\s+a\s+table|as\s+a\s+table|side-by-side\s+table)\b", u_lower)
+            and re.search(r"\b(and|vs\.?|versus|both)\b", u_lower)
+        )
+        or re.search(
+            r"^(?:please\s+)?(?:list|compare|contrast|tabulate)\s+(?:all\s+(?:of\s+)?(?:the\s+)?)?.+\b(?:of|for|between)\s+[A-Z][a-zA-Z0-9\-]+\s+and\s+[A-Z][a-zA-Z0-9\-]+",
+            user_input.strip(),
+        )
+    )
+    if not (is_deep_dive or is_multi_entity_or_exhaustive_table):
         return None
 
     try:
@@ -1472,9 +1490,14 @@ def plan_parallel_sections(user_input: str) -> list[str] | None:
             {
                 "role": "system",
                 "content": (
-                    "Decompose the user's request into exactly 4 distinct, non-overlapping section titles "
-                    "that can be written in parallel to form a complete, well-structured response.\n"
-                    "Output ONLY 4 lines, one concise section title per line (no numbering, no bullets, no preamble)."
+                    "Decompose the user's request into 4 distinct, non-overlapping section titles "
+                    "(or 2-3 if the topic only has 2-3 small parts) that can be generated in parallel by separate worker streams.\n"
+                    "- IMPORTANT: When the user asks to 'List all...' for 2 large categories (such as 'named moons of Saturn and Jupiter', "
+                    "which each have 50+ named moons), ALWAYS split each category into 2 logical sub-sections (4 sections total: "
+                    "e.g., 'Named Moons of Saturn — Major & Inner Regular Moons', 'Named Moons of Saturn — Irregular Outer Moons (Inuit, Gallic & Norse Groups)', "
+                    "'Named Moons of Jupiter — Inner, Galilean & Prograde Moons', 'Named Moons of Jupiter — Retrograde Outer Moons (Ananke, Carme & Pasiphae Groups)') "
+                    "so 4 parallel streams share the table generation load.\n"
+                    "- Output ONLY the section titles, one per line (no numbering, no bullets, no preamble)."
                 ),
             },
             {"role": "user", "content": user_input},
@@ -1486,7 +1509,7 @@ def plan_parallel_sections(user_input: str) -> list[str] | None:
             "model": MODEL_NAME,
             "messages": req_messages,
             "temperature": 0.0,
-            "max_tokens": 100,
+            "max_tokens": 110,
         }
         if extra_params:
             create_kwargs["extra_body"] = extra_params
@@ -1498,7 +1521,7 @@ def plan_parallel_sections(user_input: str) -> list[str] | None:
             cleaned_ln = re.sub(r"^[\s\-\*\d\.\)\:]+", "", ln).strip().strip("*\"'`")
             if len(cleaned_ln) >= 4:
                 lines.append(cleaned_ln[:90])
-        if 3 <= len(lines) <= 5:
+        if 2 <= len(lines) <= 5:
             return lines[:5]
     except Exception:
         pass
@@ -1712,14 +1735,24 @@ def stream_parallel_sections(
     lock = threading.Lock()
     start_time = time.perf_counter()
 
+    is_exhaustive_list = bool(
+        re.search(r"\b(list\s+all|all\s+of\s+the|every|complete|in\s+a\s+table|table)\b", shared_active_user_content.lower())
+    )
+    per_stream_max_tokens = min(1400 if is_exhaustive_list else 750, MODEL_PROFILE["max_gen_tokens"])
+
     def _run_section_stream(idx: int, sec_title: str):
         other_titles = ", ".join(f"'{s}'" for j, s in enumerate(sections) if j != idx)
+        length_guidance = (
+            f"- Provide a complete, accurate Markdown table for `{sec_title}` combining the web search context with verified internal reference knowledge (never invent or guess names)."
+            if is_exhaustive_list
+            else f"- Focus exclusively on `{sec_title}` (~150–250 words, using Markdown tables or bullets where helpful)."
+        )
         tail_assignment = (
             f"\n\n### PARALLEL STREAM ASSIGNMENT (Section {idx + 1} of {n_streams}):\n"
             f"You are Stream {idx + 1} of {n_streams} generating a multi-section response in parallel.\n"
             f"Write ONLY Section {idx + 1}: **{sec_title}**.\n"
             f"- Start directly with the Markdown heading `### {idx + 1}. {sec_title}`.\n"
-            f"- Focus exclusively on `{sec_title}` (~120–220 words, using Markdown tables or bullets where helpful).\n"
+            f"{length_guidance}\n"
             f"- Do NOT cover the other parallel sections ({other_titles}) and do NOT include a generic intro or conclusion."
         )
         sec_payload = list(base_prefix_messages) + [
@@ -1741,7 +1774,7 @@ def stream_parallel_sections(
             "model": MODEL_NAME,
             "messages": active_sec_msgs,
             "temperature": 0.6 if use_thinking else 0.7,
-            "max_tokens": min(700, MODEL_PROFILE["max_gen_tokens"]),
+            "max_tokens": per_stream_max_tokens,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -2065,6 +2098,7 @@ while True:
                 "### INSTRUCTIONS:\n"
                 f"Today's date is {CURRENT_DATE_STR}. Your internal pre-training knowledge ended in 2024.\n"
                 "- Use the live 2026 web data whenever it is relevant or updates your 2024 training weights; if the web snippets are unrelated to an abstract/conceptual question, rely on your internal knowledge.\n"
+                "- When the user asks for an exhaustive list or table (e.g., 'List all named moons...', 'List all elements...'), combine the web data with your complete internal knowledge so the table is comprehensive and NEVER restricted to only the few examples mentioned in short web snippets.\n"
                 "- CRITICAL: Chronological tables (such as lists of Presidents, leaders, or champions) list the oldest entries at the top and the MOST RECENT / INCUMBENT entries (2025–2026) at the bottom. Always check the bottom rows (e.g., #47 / 'Incumbent' / 2025–present) and override both your 2024 pre-training memory AND any stale earlier conversation turns with the 2025–2026 facts in the table!\n"
                 "- When asked for the 'last N' or 'most recent N' presidents, leaders, or winners, list them in reverse chronological order starting from the current 2025–2026 incumbent at the bottom of the table (e.g., for last 5 US Presidents: start at #47 Donald Trump [2025–Incumbent], #46 Joe Biden [2021–2025], #45 Donald Trump [2017–2021], #44 Barack Obama [2009–2017], #43 George W. Bush [2001–2009], and #42 Bill Clinton [1993–2001] so both the last 5 presidencies and last 5 distinct individuals are clear)."
                 f"{quant_instruction}\n\n"
