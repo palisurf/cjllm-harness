@@ -10,7 +10,7 @@ extraction, rolling summary-buffer memory compression, and live TTFT/TPS telemet
 """
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import html
 import json
 import os
@@ -19,6 +19,7 @@ import readline
 import time
 import warnings
 from urllib.parse import quote_plus
+from zoneinfo import ZoneInfo
 from openai import OpenAI
 from rich.console import Console
 from rich.live import Live
@@ -90,9 +91,42 @@ parser.add_argument(
 parser.add_argument(
     "--think",
     action="store_true",
-    help="Start session with Chain-of-Thought reasoning mode enabled",
+    help="Start session with Chain-of-Thought reasoning enabled",
+)
+parser.add_argument(
+    "--tz",
+    default=os.environ.get("CJLLM_TZ", None),
+    help="IANA timezone override for local clock (default: OS local timezone, or America/Los_Angeles if OS is Etc/UTC)",
 )
 args, _ = parser.parse_known_args()
+
+
+def resolve_local_timezone(tz_override: str | None = None):
+    """
+    Resolves the user's local timezone. Many headless Linux servers and Docker containers
+    default their OS clock to `Etc/UTC`, which shifts the calendar date forward by 1 day
+    every evening after 5:00 PM Pacific Time. When the OS timezone is generic UTC/GMT and no
+    explicit override is given, defaults to `America/Los_Angeles` (Pacific Time).
+    """
+    if tz_override:
+        try:
+            return ZoneInfo(tz_override)
+        except Exception:
+            pass
+    try:
+        sys_now = datetime.now().astimezone()
+        tz_name = (sys_now.tzname() or "").upper()
+        if tz_name not in ("UTC", "ETC/UTC", "GMT", "UCT", ""):
+            return sys_now.tzinfo
+    except Exception:
+        pass
+    try:
+        return ZoneInfo("America/Los_Angeles")
+    except Exception:
+        return timezone(timedelta(hours=-7), name="PDT")
+
+
+LOCAL_TZ = resolve_local_timezone(args.tz)
 
 # Initialize OpenAI client pointing to local inference engine
 client = OpenAI(
@@ -773,16 +807,104 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", m
 
 def get_dual_clock_str() -> tuple[str, str, str]:
     """
-    Returns (today_date_str, local_clock_str, utc_clock_str) with both 12-hour and 24-hour
-    representations so the model and search router always know both the user's local timezone
-    clock and the current UTC/GMT clock without 12h/24h subtraction confusion.
+    Returns (today_date_str, local_clock_str, utc_clock_str) using the resolved LOCAL_TZ
+    (e.g. America/Los_Angeles PDT/PST even on headless Etc/UTC Linux servers) with both
+    12-hour and 24-hour representations.
     """
-    now_local = datetime.now().astimezone()
+    now_local = datetime.now(LOCAL_TZ)
     now_utc = datetime.now(timezone.utc)
     today_str = now_local.strftime("%A, %B %d, %Y")
-    local_clock_str = now_local.strftime("%A, %B %d, %Y %I:%M %p (%H:%M) %Z")
-    utc_clock_str = now_utc.strftime("%A, %B %d, %Y %I:%M %p (%H:%M) UTC/GMT")
+    local_clock_str = now_local.strftime("%A, %B %d, %Y %I:%M:%S %p (%H:%M:%S) %Z")
+    utc_clock_str = now_utc.strftime("%A, %B %d, %Y %I:%M:%S %p (%H:%M:%S) UTC/GMT")
     return today_str, local_clock_str, utc_clock_str
+
+
+WORLD_CLOCK_ZONES: list[tuple[str, str, tuple[str, ...]]] = [
+    ("Pacific Time (Los Angeles / Malibu)", "America/Los_Angeles", ("pacific", "pdt", "pst", "los angeles", "malibu", "california", "san francisco", "seattle")),
+    ("Mountain Time (Denver / Phoenix)", "America/Denver", ("mountain", "mdt", "mst", "denver", "utah", "colorado")),
+    ("Central Time (Chicago / Dallas)", "America/Chicago", ("central", "cdt", "cst", "chicago", "dallas", "houston", "texas")),
+    ("Eastern Time (New York / Miami)", "America/New_York", ("eastern", "edt", "est", "new york", "nyc", "boston", "miami", "washington")),
+    ("Hawaii Time (Honolulu)", "Pacific/Honolulu", ("hawaii", "hst", "honolulu", "maui", "lahaina")),
+    ("UTC / GMT", "UTC", ("utc", "gmt", "zulu", "universal")),
+    ("London (UK)", "Europe/London", ("london", "uk", "britain", "bst")),
+    ("Central Europe (Paris / Berlin / Zurich)", "Europe/Paris", ("paris", "berlin", "cet", "cest", "zurich", "madrid", "rome", "europe")),
+    ("Tokyo (Japan)", "Asia/Tokyo", ("tokyo", "japan", "jst")),
+    ("Seoul (South Korea)", "Asia/Seoul", ("seoul", "korea", "kst")),
+    ("Taipei / Hong Kong / Singapore", "Asia/Taipei", ("taipei", "taiwan", "hong kong", "singapore", "beijing", "shanghai")),
+    ("India (IST)", "Asia/Kolkata", ("india", "ist", "mumbai", "bangalore", "delhi")),
+    ("Sydney (Australia)", "Australia/Sydney", ("sydney", "australia", "melbourne", "aest", "aedt")),
+]
+
+
+def is_clock_skill_query(user_input: str) -> bool:
+    """
+    Detects queries asking for the current time, current date, day of the week,
+    calendar offsets ('what day is tomorrow/yesterday'), or world timezone conversions.
+    """
+    u_lower = user_input.lower().strip()
+    clock_patterns = (
+        r"\b(what\s+time\s+is\s+it|what'?s\s+the\s+(?:current\s+)?time|current\s+time|time\s+is\s+it\s+now|time\s+right\s+now|time\s+now)\b",
+        r"\b(what\s+is\s+the\s+(?:current\s+)?(?:date|time)|current\s+date(?:\s*/\s*time|\s+and\s+time)?|today'?s\s+date|what\s+date\s+is\s+(?:it|today))\b",
+        r"\b(what\s+day\s+(?:of\s+the\s+week\s+)?is\s+(?:it|today|tomorrow|yesterday))\b",
+        r"\b(what\s+time\s+is\s+it\s+in\s+[a-z\s]+)\b",
+        r"\b(current\s+time\s+in\s+[a-z\s]+)\b",
+        r"\b(tell\s+me\s+the\s+(?:current\s+)?(?:time|date))\b",
+    )
+    return any(re.search(pat, u_lower) for pat in clock_patterns)
+
+
+def is_external_data_query(user_input: str) -> bool:
+    """Returns True if the query also asks for external web data (weather, surf, tides, stocks, news, buoys)."""
+    u_lower = user_input.lower()
+    return bool(
+        re.search(
+            r"\b(weather|forecast|surf|swell|tide|tides|buoy|ndbc|stock|price|market|dow|nasdaq|s&p|news|score|standings|table|largest|tallest)\b",
+            u_lower,
+        )
+    )
+
+
+def build_live_clock_skill_context(user_input: str) -> tuple[str, str]:
+    """
+    Executes the built-in Current Time, Date & World Clock Skill using the system's atomic
+    NTP-synchronized clock and IANA zoneinfo database.
+    Returns (short_console_status, detailed_skill_block).
+    """
+    now_local = datetime.now(LOCAL_TZ)
+    now_utc = datetime.now(timezone.utc)
+    yesterday_local = now_local - timedelta(days=1)
+    tomorrow_local = now_local + timedelta(days=1)
+
+    short_status = (
+        f"{now_local.strftime('%A, %B %d, %Y • %I:%M:%S %p %Z (%H:%M:%S)')} | "
+        f"UTC: {now_utc.strftime('%H:%M:%S UTC (%a %b %d)')}"
+    )
+
+    u_lower = user_input.lower()
+    world_lines = []
+    for label, iana_name, keywords in WORLD_CLOCK_ZONES:
+        # Always include US zones + UTC, plus any international zone matching the prompt
+        if iana_name in ("America/Los_Angeles", "America/New_York", "UTC") or any(k in u_lower for k in keywords):
+            try:
+                z_dt = now_utc.astimezone(ZoneInfo(iana_name))
+                world_lines.append(f"  • {label}: {z_dt.strftime('%A, %B %d, %Y at %I:%M:%S %p %Z (%H:%M:%S)')}")
+            except Exception:
+                continue
+
+    skill_block = (
+        "--- [SKILL: LIVE SYSTEM CLOCK & CALENDAR (AUTHORITATIVE REAL-TIME GROUNDING)] ---\n"
+        f"• Current Local Date & Time : {now_local.strftime('%A, %B %d, %Y at %I:%M:%S %p %Z (%H:%M:%S, UTC%z)')}\n"
+        f"• Current UTC / GMT Time    : {now_utc.strftime('%A, %B %d, %Y at %I:%M:%S %p UTC (%H:%M:%S GMT)')}\n"
+        f"• Unix Epoch Timestamp      : {int(now_utc.timestamp())}\n"
+        "• Local Calendar Reference  :\n"
+        f"  - Yesterday : {yesterday_local.strftime('%A, %B %d, %Y')}\n"
+        f"  - Today     : {now_local.strftime('%A, %B %d, %Y')}\n"
+        f"  - Tomorrow  : {tomorrow_local.strftime('%A, %B %d, %Y')}\n"
+    )
+    if world_lines:
+        skill_block += "• World Clock Reference     :\n" + "\n".join(world_lines) + "\n"
+    skill_block += "--- [END LIVE SYSTEM CLOCK SKILL] ---"
+    return short_status, skill_block
 
 
 def fetch_web_context(
@@ -892,6 +1014,10 @@ def determine_search_query(user_input: str, history: list) -> str | None:
     - Automatically adapts to the active MODEL_PROFILE (skipping CoT when supported).
     """
     u_lower = user_input.lower().strip()
+
+    # Fast deterministic guard: pure clock/date/day-of-week queries are answered by the built-in Current Time Skill
+    if is_clock_skill_query(user_input) and not is_external_data_query(user_input):
+        return None
 
     # Fast deterministic guard against pure coding / math / textbook physics false positives
     is_pure_code_or_math = (
@@ -1135,15 +1261,17 @@ if not start_file:
 conversation_history, summary_buffer = re_hydrate_cache(start_file)
 
 CURRENT_DATE_STR, CURRENT_LOCAL_CLOCK_STR, CURRENT_UTC_CLOCK_STR = get_dual_clock_str()
+LOCAL_TZ_LABEL = datetime.now(LOCAL_TZ).strftime("%Z (UTC%z)")
 BASE_SYSTEM_PROMPT = (
-    f"You are an intelligent, concise AI assistant. Today's date is {CURRENT_DATE_STR} "
-    f"(Local Time: {CURRENT_LOCAL_CLOCK_STR} | UTC/GMT Time: {CURRENT_UTC_CLOCK_STR}). "
+    f"You are an intelligent, concise AI assistant. Today's local date is {CURRENT_DATE_STR} "
+    f"(Local Timezone: {LOCAL_TZ_LABEL}). "
     "Prioritize answering the user's latest message directly and accurately, "
     "while using prior conversation turns to resolve follow-up references and maintain continuity. "
     "Treat the Prior Conversation Summary Buffer as background context. "
-    "When web search data is provided, always prefer the live retrieved figures and tables over pre-training knowledge. "
+    "When a [SKILL: LIVE SYSTEM CLOCK & CALENDAR] block or live web search data is provided in the active turn, "
+    "always report the exact live timestamps, dates, figures, and tables from that block over pre-training knowledge or older turns. "
     "NEVER invent, estimate, or generate placeholder tables or figures when real-time data is requested; "
-    "report only the exact measurements present in the retrieved web data."
+    "report only the exact measurements present in the retrieved data."
 )
 
 if conversation_history is None:
@@ -1249,9 +1377,19 @@ while True:
 
         use_thinking = think_mode or force_think_this_turn
 
+        # Built-in Current Time, Date & World Clock Skill
+        use_clock_skill = is_clock_skill_query(user_input)
+        clock_skill_block = ""
+        if use_clock_skill:
+            clock_status, clock_skill_block = build_live_clock_skill_context(user_input)
+            console.print(f"[dim][Skill: Current Time] [bold cyan]{clock_status}[/bold cyan][/dim]")
+
         # Context-Aware Hybrid Search Classification Step
-        console.print("[dim]Analyzing search intent...[/dim]", end="\r")
-        search_query = determine_search_query(user_input, conversation_history)
+        if use_clock_skill and not is_external_data_query(user_input):
+            search_query = None
+        else:
+            console.print("[dim]Analyzing search intent...[/dim]", end="\r")
+            search_query = determine_search_query(user_input, conversation_history)
 
         is_quant_query = needs_quantitative_reasoning(user_input)
         quant_instruction = (
@@ -1264,11 +1402,20 @@ while True:
         if search_query:
             console.print(f"[dim]Searching web (max 5) for: '[bold cyan]{search_query}[/bold cyan]'...[/dim]")
             web_payload = fetch_web_context(search_query, max_results=5)
+            skill_prefix = f"{clock_skill_block}\n\n" if clock_skill_block else ""
             active_user_content = (
-                f"{web_payload}\n"
+                f"{skill_prefix}{web_payload}\n"
                 "### INSTRUCTIONS:\n"
-                "Answer the Active User Request below using the web search data above where relevant, "
+                "Answer the Active User Request below using the live data above where relevant, "
                 f"while maintaining continuity with our recent conversation history.{quant_instruction}\n\n"
+                f"### ACTIVE USER REQUEST:\n{user_input}"
+            )
+        elif use_clock_skill:
+            active_user_content = (
+                f"{clock_skill_block}\n\n"
+                "### INSTRUCTIONS:\n"
+                "Answer the Active User Request below using the exact live current time, date, day of the week, and timezone values "
+                f"from the [SKILL: LIVE SYSTEM CLOCK & CALENDAR] block above. Ignore any older timestamps from earlier conversation turns.{quant_instruction}\n\n"
                 f"### ACTIVE USER REQUEST:\n{user_input}"
             )
         else:

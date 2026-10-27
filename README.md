@@ -102,8 +102,11 @@ At startup, the harness queries `/v1/models` to auto-discover the active model I
 2. **`native_think`:** Engaged when the model uses literal `<think>` / `</think>` tokens (native `DeepSeek-R1`, `Qwen3`, `QwQ`).
 3. **`standard_instruct`:** Engaged for non-reasoning instruct models (`Llama-3.1-70B-Instruct`, `Llama-3.1-8B-Instruct`, `Mistral`, `Gemma`). Sends standard chat completion payloads while still supporting `/think` via prompt-guided `<think>...</think>` tags.
 
-#### C. Context-Aware, Multi-Hop & Date-Grounded Search Intent Router (`determine_search_query`)
-* **Dual Local & UTC/GMT Clock Grounding (`get_dual_clock_str`):** Injects both the local system clock (`PDT/PST`) and the current `UTC/GMT` clock (in both 12-hour and 24-hour formats) into the search classifier, web context header, and `BASE_SYSTEM_PROMPT`. This ensures relative time queries (*"today"*, *"this week"*, *"how many minutes ago"*) and UTC-stamped marine/aviation reports (like NOAA buoys crossing UTC midnight) are always converted and subtracted accurately.
+#### C. Built-In Current Time, Date & World Clock Skill (`build_live_clock_skill_context`) + Context-Aware Search Router (`determine_search_query`)
+* **Built-In Current Time, Calendar & World Clock Skill (`is_clock_skill_query` / `build_live_clock_skill_context`):**
+  * Automatically resolves the user's local IANA timezone (`--tz` or `CJLLM_TZ`, defaulting to `America/Los_Angeles` `PDT`/`PST` when running on headless `Etc/UTC` Linux servers/containers so evening queries after 5:00 PM Pacific never roll forward into tomorrow's UTC date).
+  * Intercepts queries asking for the current time, date, day of the week (*"What time is it now"*, *"What day of the week is tomorrow"*), or world timezones (*"What time is it in Tokyo and London right now?"*) and injects an authoritative `[SKILL: LIVE SYSTEM CLOCK & CALENDAR]` block into the active turn (`messages[-1]`) down to the second—without mutating `messages[0]` (preserving 100% KV prefix-cache hit rates) and overriding any older timestamps in conversation history.
+* **Dual Local & UTC/GMT Clock Grounding (`get_dual_clock_str`):** Injects both the local system clock (`PDT/PST`) and the current `UTC/GMT` clock (in both 12-hour and 24-hour formats) into the search classifier and web context header so UTC-stamped marine/aviation reports (like NOAA buoys crossing UTC midnight) are always converted and subtracted accurately.
 * **3-Turn Multi-Hop & Entity Resolution:** Inspects up to 3 conversation turn pairs (`600` chars/turn) and automatically indexes 5-digit NOAA buoy station IDs and location clauses from recent history so multi-hop follow-ups (*"Pull the readings for that buoy"*, *"the second one"*, *"for today only instead"*) preserve the exact station ID or ticker.
 * **Pure Code/Math False-Positive Guard & Reasoning-Leak Filter:** Deterministically skips web searches on pure coding, circuit physics, and calculus prompts containing words like *"current"* or *"today"*, while stripping `"Search Query:"` labels and rejecting >12-word reasoning sentences.
 
@@ -167,6 +170,7 @@ python3 cjllm.py \
   --max-pairs 30 \
   --max-verbatim-tokens 20000 \
   --evict-batch 8 \
+  --tz America/Los_Angeles \
   --cache chat_cache.json \
   --think
 ```
