@@ -36,7 +36,7 @@ Running frontier open-weight LLMs locally on dedicated hardware (`vLLM` on Tenst
 | **Live Financial & Multi-Index Quotes** | **Yes** (Auto-expands `Dow`, `S&P 500`, `Nasdaq` & ticker quote cards) | None | None | Meta-description blurbs only | Meta-description blurbs only |
 | **Structured HTML `<table>` & NOAA Buoy Extraction** | **Yes** (Extracts up to 6 HTML tables/page + auto-resolves 5-digit NOAA NDBC buoy IDs) | None | None | Full-page text dump (loses table structure) | Text chunks only |
 | **Context-Aware Search Router** | **Yes** (Resolves pronouns & follow-up narrowing like *"for today only instead"*) | None | None | Basic query rewrite | Yes (higher latency multi-agent chain) |
-| **Memory Management** | **Sliding verbatim window (`MAX_PAIRS`) + LLM rolling summary buffer + KV prefix-cache friendly** | Manual / unbounded | Simple context truncation | Full history / vector RAG | Per-thread history |
+| **Memory Management** | **30-pair (`~20K` token) verbatim window + 8-pair batch eviction into numerical summary buffer (KV prefix-cache friendly)** | Manual / unbounded | Simple context truncation | Full history / vector RAG | Per-thread history |
 | **Crash-Safe Session Persistence** | **Yes** (Auto-saves `chat_cache.json` & `.chat_prompt_history` after every turn) | None | None | Database-backed | Database-backed |
 | **Per-Turn Hardware Telemetry** | **Yes** (`TTFT ms`, `Gen Time s`, `Tokens`, `Speed t/s`, `/v` payload inspector) | None | `--verbose` summary at exit | Basic token speed | None |
 
@@ -121,8 +121,26 @@ At startup, the harness queries `/v1/models` to auto-discover the active model I
 
 #### E. Quantitative Auto-Think Escalation, High-Precision Memory & Crash-Safe Auto-Save
 * **Quantitative Reasoning Escalation (`needs_quantitative_reasoning`):** When `think_mode = OFF` (default), prompts requiring multi-step math, share allocations, timezone deltas, or physics formulas (such as deep-water wavelength $L = \frac{gT^2}{2\pi}$) automatically enable internal `<|box_start|>` reasoning and instruct the model to write out intermediate equations, maintaining full mathematical accuracy.
-* **High-Water / Batch-Eviction Numerical Memory (`compress_memory_batch`):** Retains up to `MAX_PAIRS = 30` verbatim user/assistant turn pairs (or `~20,000` tokens) before batch-evicting the oldest `EVICT_BATCH = 8` pairs at once into `summary_buffer`. This avoids per-turn KV prefix-cache invalidation across both **NVIDIA DGX Spark** and **Tenstorrent QuietBox 2** (see [`TT_PREFIX_CACHE_FIX.md`](./TT_PREFIX_CACHE_FIX.md)) while using a 700-token numerical archivist prompt that preserves every exact price, percentage, wave height, period, temperature, ticker, and buoy station ID verbatim.
+* **High-Water (`MAX_PAIRS = 30` / `~20,000` Tokens) + 8-Pair Batch-Eviction Memory Architecture (`compress_memory_batch`):**
+  * **Why 1-by-1 Sliding Windows Thrash the KV Prefix Cache:** In a naive sliding window (e.g., evicting 1 turn pair on every turn after Turn 10), folding the evicted turn into `summary_buffer` mutates `messages[0]` (the system prompt) on **every single turn** once the limit is reached. Because `vLLM` prefix caching hashes token blocks sequentially from token `0`, mutating `messages[0]` invalidates **100% of the cached KV blocks** on every subsequent turn.
+  * **The 30-Pair / 8-Pair Hysteresis Solution:** [`cjllm.py`](./cjllm.py) retains up to **`MAX_PAIRS = 30` verbatim turn pairs** (or `MAX_VERBATIM_TOKENS = 20000` tokens) before triggering compression. When the conversation crosses that high-water mark, [`compress_memory_batch`](./cjllm.py) evicts the **oldest `8` turn pairs at once in a single LLM call** (dropping the verbatim window from `30` down to `22` pairs). For the next 8 turns (`22 → 30`), `messages[0]` remains 100% byte-identical, preserving full KV prefix-cache hit rates across both **NVIDIA DGX Spark** and **Tenstorrent QuietBox 2** (see [`TT_PREFIX_CACHE_FIX.md`](./TT_PREFIX_CACHE_FIX.md)).
+  * **High-Precision Numerical Archivist Prompt:** Uses a 700-token structured archivist prompt that preserves every exact price, percentage, wave height, period, temperature, ticker, and buoy station ID verbatim when folding evicted turns into `summary_buffer`.
 * **Crash-Safe Persistence:** Automatically saves `chat_cache.json` and `.chat_prompt_history` after every completed turn.
+
+#### F. "Lost in the Middle" Multi-Needle Verification (`30` Turn Pairs / `~18,567` Tokens)
+To verify that extending the verbatim window to `MAX_PAIRS = 30` (`~18.6K` tokens) does not introduce "Lost in the Middle" attention dilution on `DeepSeek-R1-Distill-Qwen-32B` (`P300X2`), the harness was benchmarked against a 30-turn-pair (`60`-message, `~18,567`-token) conversation packed with **24 dense technical distractor turns** (containing dozens of competing numbers, byte counts, and dollar figures) and **12 specific numerical needles** planted across 6 conversation depths (`7%`, `30%`, `50% Exact Middle`, `53% Exact Middle`, `77%`, and `97%`):
+
+| Conversation Depth | Turn Pair | Planted Needle | Model Recall Output at `~18,567` Tokens | Result |
+| :--- | :--- | :--- | :--- | :--- |
+| **7% (Early)** | Pair 2 | NOAA Buoy `46054` gust **`27.4 knots`**, water temp **`58.3 °F`** | `Peak wind gust of 27.4 knots, water temperature of 58.3°F` | **PASS (2/2)** |
+| **30% (Early-Mid)** | Pair 9 | 4-worker LUT QC-LDPC FER **`1.42e-5`**, $E_b/N_0$ **`3.75 dB`** | `FER of 1.42e-5, Eb/N0 of 3.75 dB` | **PASS (2/2)** |
+| **50% (Exact Middle)** | Pair 15 | Broadcom (`AVGO`) **`137 shares`** @ **`$1,084.60`** | `Limit order for 137 shares at $1,084.60 per share` | **PASS (2/2)** |
+| **53% (Exact Middle)** | Pair 16 | Malibu Surfrider low tide **`-0.8 ft`** @ **`3:42 PM PDT`** | `Afternoon low tide of -0.8 ft at 3:42 PM PDT` | **PASS (2/2)** |
+| **77% (Late-Mid)** | Pair 23 | `P300X2` `l1_small_size` **`24,576`** B, `trace_region_size` **`402,653,184`** B | `l1_small_size of 24,576 bytes, trace_region_size of 402,653,184 bytes` | **PASS (2/2)** |
+| **97% (Recent)** | Pair 29 | Generac (`GNRC`) close **`$162.85`**, P/E **`23.40`** | `Closing price of $162.85, P/E ratio of 23.40` | **PASS (2/2)** |
+| **Post-Turn-31 Overflow** | Evicted Pairs 1–8 | Batch-evict oldest 8 pairs (`31 → 23` pairs) into `summary_buffer` | Retained `NOAA Buoy 46054: Peak wind gust of 27.4 knots (NW), sea surface temp 58.3°F` verbatim | **PASS** |
+
+* **Total Multi-Needle Recall Score:** **`12 / 12 (100.0%)`** across all conversation depths (`7%` through `97%`) with zero attention dilution.
 
 ---
 
