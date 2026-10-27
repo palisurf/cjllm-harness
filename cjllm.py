@@ -759,15 +759,15 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", m
 
 def get_dual_clock_str() -> tuple[str, str, str]:
     """
-    Returns (today_date_str, local_clock_str, utc_clock_str) so the model and search router
-    always know both the user's local timezone clock and the current UTC/GMT clock (critical
-    for NOAA NDBC buoy timestamps and financial/market close comparisons).
+    Returns (today_date_str, local_clock_str, utc_clock_str) with both 12-hour and 24-hour
+    representations so the model and search router always know both the user's local timezone
+    clock and the current UTC/GMT clock without 12h/24h subtraction confusion.
     """
     now_local = datetime.now().astimezone()
     now_utc = datetime.now(timezone.utc)
     today_str = now_local.strftime("%A, %B %d, %Y")
-    local_clock_str = now_local.strftime("%A, %B %d, %Y %I:%M %p %Z")
-    utc_clock_str = now_utc.strftime("%Y-%m-%d %H:%M UTC (GMT)")
+    local_clock_str = now_local.strftime("%A, %B %d, %Y %I:%M %p (%H:%M) %Z")
+    utc_clock_str = now_utc.strftime("%A, %B %d, %Y %I:%M %p (%H:%M) UTC/GMT")
     return today_str, local_clock_str, utc_clock_str
 
 
@@ -1006,21 +1006,51 @@ def determine_search_query(user_input: str, history: list) -> str | None:
         return None
 
 
+def needs_quantitative_reasoning(user_input: str) -> bool:
+    """
+    Detects prompts that require multi-step arithmetic, portfolio share allocation,
+    unit conversion, or physics/engineering formula evaluation so the harness can
+    instruct the model to show explicit intermediate equations even when think_mode is OFF.
+    """
+    u_lower = user_input.lower()
+    quant_patterns = (
+        r"\b(calculate|compute|derive|solve|formula|equation|wavelength|phase\s+speed)\b",
+        r"\b(how\s+many\s+(?:whole\s+)?shares|left\s+over|remainder|split\s+\d+\s*/\s*\d+|allocation)\b",
+        r"\b(ratio\s+of|percentage\s+difference|compound\s+annual|cagr|standard\s+deviation)\b",
+        r"\b(convert\b.*\bto\b.*\band\b|in\s+both\s+(?:utc|gmt|meters|feet|knots))\b",
+        r"\b(minutes\s+ago|hours\s+ago|how\s+long\s+ago)\b",
+        r"\$\s*\d[\d,]*(?:\.\d+)?",
+    )
+    return any(re.search(pat, u_lower) for pat in quant_patterns)
+
+
 def compress_memory(existing_summary: str, old_user: str, old_assistant: str) -> str:
     """
     Uses a non-thinking completion pass to fold overflowing turn pairs into the summary buffer
-    without leaking Chain-of-Thought into the system prompt.
+    while preserving all exact numerical figures, tickers, timestamps, and station IDs verbatim.
     """
     prompt = (
         f"Existing Conversation Summary:\n{existing_summary if existing_summary else 'None'}\n\n"
-        f"Turn to Integrate:\nUser: {old_user}\nAssistant Answer: {old_assistant}\n\n"
-        "Provide an updated, concise summary (2-4 sentences max) capturing key entities, user requirements, "
-        "and core conclusions. Do NOT include meta-commentary, disclaimers, or web search boilerplate."
+        f"New Turn to Integrate:\nUser: {old_user}\nAssistant Answer: {old_assistant}\n\n"
+        "Produce an updated, dense bulleted memory log (up to 12 concise bullets) that:\n"
+        "1. Retains all existing facts and topics from Existing Conversation Summary.\n"
+        "2. Integrates the New Turn while preserving EVERY exact number, stock price, point/percentage change, "
+        "wave height, wave period, wave direction, temperature, date/time, ticker symbol, and 5-digit buoy station ID verbatim.\n"
+        "3. NEVER replaces specific numbers with vague prose (for example, write "
+        "'Buoy 46221: WVHT 3.6 ft (1.1 m), DPD 14 sec, APD 6.9 sec, MWD 284 deg, WTMP 63.1°F; "
+        "^DJI 47,951.85 (-0.28%), ^GSPC 7,089.14 (-0.25%), ^IXIC 23,825.46 (-0.83%)' instead of 'provided buoy and index readings').\n"
+        "Output ONLY the bulleted list with no preamble or meta-commentary."
     )
     try:
         console.print("[dim]Updating rolling memory summary buffer...[/dim]")
         base_messages = [
-            {"role": "system", "content": "You are a concise conversation memory summarizer."},
+            {
+                "role": "system",
+                "content": (
+                    "You are a high-precision numerical conversation memory archivist. "
+                    "You never drop or round away exact numbers, tickers, or station IDs when summarizing."
+                ),
+            },
             {"role": "user", "content": prompt},
         ]
         req_messages, extra_params = prepare_request_messages_and_extra(
@@ -1030,7 +1060,7 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
             "model": MODEL_NAME,
             "messages": req_messages,
             "temperature": 0.0,
-            "max_tokens": 400,
+            "max_tokens": 600,
         }
         if extra_params:
             create_kwargs["extra_body"] = extra_params
@@ -1042,7 +1072,7 @@ def compress_memory(existing_summary: str, old_user: str, old_assistant: str) ->
     except Exception:
         pass
 
-    entry = f"User asked: '{old_user}' | Assistant answered: '{old_assistant[:120]}...'"
+    entry = f"User asked: '{old_user}' | Assistant answered: '{old_assistant[:240]}...'"
     return f"{existing_summary}\n- {entry}" if existing_summary else f"- {entry}"
 
 
@@ -1185,6 +1215,14 @@ while True:
         console.print("[dim]Analyzing search intent...[/dim]", end="\r")
         search_query = determine_search_query(user_input, conversation_history)
 
+        is_quant_query = needs_quantitative_reasoning(user_input)
+        quant_instruction = (
+            "\n- For any mathematical calculations, share allocations, elapsed time ('minutes ago' by subtracting in the same timezone), or physics formulas requested, "
+            "write out each intermediate step and equation explicitly before stating the final result so every number is exact."
+            if is_quant_query
+            else ""
+        )
+
         if search_query:
             console.print(f"[dim]Searching web (max 5) for: '[bold cyan]{search_query}[/bold cyan]'...[/dim]")
             web_payload = fetch_web_context(search_query, max_results=5)
@@ -1192,12 +1230,16 @@ while True:
                 f"{web_payload}\n"
                 "### INSTRUCTIONS:\n"
                 "Answer the Active User Request below using the web search data above where relevant, "
-                "while maintaining continuity with our recent conversation history.\n\n"
+                f"while maintaining continuity with our recent conversation history.{quant_instruction}\n\n"
                 f"### ACTIVE USER REQUEST:\n{user_input}"
             )
         else:
             console.print("[dim]Direct response (no web search needed).[/dim]")
-            active_user_content = user_input
+            active_user_content = (
+                f"{user_input}\n\n[Instruction: Write out each intermediate calculation step explicitly before stating the final result.]"
+                if is_quant_query and not use_thinking
+                else user_input
+            )
 
         # --- CONSTRUCT VLLM PAYLOAD ARRAY ---
         # 1. Merge Base System Prompt & Summary Buffer into a Single System Message
@@ -1218,8 +1260,9 @@ while True:
         base_payload.append({"role": "user", "content": active_user_content})
 
         # 4. Adapt payload & extra_body parameters to the auto-detected MODEL_PROFILE
+        effective_thinking = use_thinking or is_quant_query
         active_payload, extra_body_params = prepare_request_messages_and_extra(
-            base_payload, use_thinking=use_thinking, is_utility_call=False
+            base_payload, use_thinking=effective_thinking, is_utility_call=False
         )
 
         # Echo EXACT vLLM Payload Array if Verbose Mode is Active
@@ -1245,7 +1288,7 @@ while True:
         stream_kwargs = {
             "model": MODEL_NAME,
             "messages": active_payload,
-            "temperature": 0.6 if use_thinking else 0.7,
+            "temperature": 0.6 if effective_thinking else 0.7,
             "max_tokens": MODEL_PROFILE["max_gen_tokens"],
             "stream": True,
             "stream_options": {"include_usage": True},
@@ -1266,7 +1309,11 @@ while True:
                         if use_thinking:
                             live.update(Markdown(format_thinking_markdown(full_response)))
                         else:
-                            live.update(Markdown(strip_thinking_and_dedup(full_response)))
+                            cleaned_live = strip_thinking_and_dedup(full_response)
+                            if cleaned_live:
+                                live.update(Markdown(cleaned_live))
+                            elif is_quant_query:
+                                live.update(Markdown("*Calculating step-by-step...*"))
 
                 if hasattr(chunk, "usage") and chunk.usage:
                     completion_tokens = chunk.usage.completion_tokens

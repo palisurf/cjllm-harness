@@ -102,26 +102,27 @@ At startup, the harness queries `/v1/models` to auto-discover the active model I
 2. **`native_think`:** Engaged when the model uses literal `<think>` / `</think>` tokens (native `DeepSeek-R1`, `Qwen3`, `QwQ`).
 3. **`standard_instruct`:** Engaged for non-reasoning instruct models (`Llama-3.1-70B-Instruct`, `Llama-3.1-8B-Instruct`, `Mistral`, `Gemma`). Sends standard chat completion payloads while still supporting `/think` via prompt-guided `<think>...</think>` tags.
 
-#### C. Context-Aware & Date-Grounded Search Intent Router (`determine_search_query`)
-* **Weekday + System Clock Injection:** Injects `Today's date is <Weekday, Month Day, Year>` into the search classifier, web context header, and `BASE_SYSTEM_PROMPT` so relative time queries (*"today"*, *"this week"*, *"latest"*) always anchor to the real system clock.
-* **Follow-Up & Pronoun Resolution:** Uses recent user/assistant turns to turn conversational follow-ups (e.g., *"Ok for today only instead"* after a surf forecast query, or *"What are their github repos?"*) into self-contained search queries.
-* **Reasoning-Leak Guardrails:** Strips any `"Search Query:"` labels and rejects >12-word reasoning sentences so DuckDuckGo and Yahoo only receive clean keyword queries.
+#### C. Context-Aware, Multi-Hop & Date-Grounded Search Intent Router (`determine_search_query`)
+* **Dual Local & UTC/GMT Clock Grounding (`get_dual_clock_str`):** Injects both the local system clock (`PDT/PST`) and the current `UTC/GMT` clock (in both 12-hour and 24-hour formats) into the search classifier, web context header, and `BASE_SYSTEM_PROMPT`. This ensures relative time queries (*"today"*, *"this week"*, *"how many minutes ago"*) and UTC-stamped marine/aviation reports (like NOAA buoys crossing UTC midnight) are always converted and subtracted accurately.
+* **3-Turn Multi-Hop & Entity Resolution:** Inspects up to 3 conversation turn pairs (`600` chars/turn) and automatically indexes 5-digit NOAA buoy station IDs and location clauses from recent history so multi-hop follow-ups (*"Pull the readings for that buoy"*, *"the second one"*, *"for today only instead"*) preserve the exact station ID or ticker.
+* **Pure Code/Math False-Positive Guard & Reasoning-Leak Filter:** Deterministically skips web searches on pure coding, circuit physics, and calculus prompts containing words like *"current"* or *"today"*, while stripping `"Search Query:"` labels and rejecting >12-word reasoning sentences.
 
 #### D. 4-Tier Live Web, Market, Weather, Surf & Buoy Extractor (`fetch_web_context`)
-1. **Live Market, Multi-Index, Weather & Fact Cards (`fetch_yahoo_rich_cards`):**
-   * **Stock & Multi-Index Quotes:** Extracts live prices, point/percentage changes, market cap, P/E, and 52-week ranges. Queries mentioning multiple market indices (*"What happened on the DOW, S&P, and Nasdaq today?"*) automatically expand to fetch all three live index cards (`^DJI`, `^GSPC`, `^IXIC`) in parallel.
-   * **Current Weather & 7-Day Forecast:** Extracts current conditions and daily high/low temperatures with condition labels.
+1. **Live Market, Multi-Ticker, Macro-Asset, Multi-City Weather & Fact Cards (`fetch_yahoo_rich_cards`):**
+   * **Stock, Multi-Index & Macro Quotes:** Automatically expands queries mentioning multiple US indices (`^DJI`, `^GSPC`, `^IXIC`, `^RUT`), macro assets (`Bitcoin`, `Ethereum`, `Gold`, `10-Year Treasury Yield`), or multiple individual stock tickers (*"Compare NVDA, AAPL, and AMD today"*) into parallel live Yahoo Finance quote card lookups.
+   * **Multi-City Current Weather & 7-Day Forecast:** Automatically splits multi-location weather comparisons (*"Compare weather in Malibu, CA vs. Honolulu, HI"*) so each city gets its own live current conditions and 7-day forecast card.
    * **Structured Entity Fact Tables:** Extracts embedded financial and company metrics.
-2. **Multi-Table HTML `<table>` & NOAA Buoy Scraper (`fetch_top_page_table_or_excerpt`):**
-   * Prioritizes tabular domains (`ndbc.noaa.gov`, `swellinfo.com`, `deepswell.com`, `surf-forecast.com`, `companiesmarketcap.com`, `stockanalysis.com`, `wikipedia.org`, `slickcharts.com`, `finance.yahoo.com`).
-   * Automatically detects 5-digit **NOAA NDBC buoy station IDs** (e.g., `46221` Santa Monica Bay, `46025` Santa Monica Basin) and directly fetches `https://www.ndbc.noaa.gov/station_page.php?station=<ID>`, extracting up to **6 HTML `<table>` blocks per page** (covering real-time wave summary, swell components, wind wave period, and 15-minute meteorological readings).
+2. **Two-Pass Multi-Table HTML `<table>` & NOAA Buoy Scraper (`fetch_top_page_table_or_excerpt`):**
+   * **Pass 1 (Tabular Priority):** Scans up to 4 candidate URLs across prioritized tabular domains (`ndbc.noaa.gov`, `weather.gov`, `swellinfo.com`, `deepswell.com`, `surf-forecast.com`, `tideschart.com`, `companiesmarketcap.com`, `stockanalysis.com`, `wikipedia.org`, `slickcharts.com`, `finance.yahoo.com`) and extracts up to **6 HTML `<table>` blocks per page**, ensuring a non-tabular rank-1 article never shadows a real table at rank 2–4.
+   * **Automatic NOAA Buoy Resolution:** Detects 5-digit **NOAA NDBC buoy station IDs** (`46221`, `46054`, `46025`, etc.) in either the search query or snippets and directly fetches `https://www.ndbc.noaa.gov/station_page.php?station=<ID>`.
+   * **Pass 2 (Plain-Text Fallback):** Falls back to a cleaned webpage excerpt only when no candidate URL contains a valid HTML `<table>`.
 3. **Filtered Organic Snippets (`DDGS().text()`):** Up to 5 cleaned organic web snippets.
 4. **Recent News Snippets (`DDGS().news()`):** Up to 3 dated news items for breaking events and market catalysts.
 
-#### E. Rolling Summary-Buffer Memory, Prefix Caching & Crash-Safe Auto-Save
-* Retains up to `MAX_PAIRS` (default `10`) verbatim user/assistant turn pairs for highKV prefix-cache hit rates across both **NVIDIA DGX Spark** and **Tenstorrent QuietBox 2** (see [`TT_PREFIX_CACHE_FIX.md`](./TT_PREFIX_CACHE_FIX.md) for details on the `tt_transformers` `PR #55630` page-table fix on `P300X2`).
-* Folds evicted turn pairs into `summary_buffer` via a fast non-thinking summarization pass (`compress_memory`).
-* Automatically persists `chat_cache.json` and `.chat_prompt_history` after every completed turn so no context is lost if an SSH session drops.
+#### E. Quantitative Auto-Think Escalation, High-Precision Memory & Crash-Safe Auto-Save
+* **Quantitative Reasoning Escalation (`needs_quantitative_reasoning`):** When `think_mode = OFF` (default), prompts requiring multi-step math, share allocations, timezone deltas, or physics formulas (such as deep-water wavelength $L = \frac{gT^2}{2\pi}$) automatically enable internal `<|box_start|>` reasoning and instruct the model to write out intermediate equations, maintaining full mathematical accuracy.
+* **High-Precision Numerical Memory Compression (`compress_memory`):** Retains up to `MAX_PAIRS` (default `10`) verbatim user/assistant turn pairs for high KV prefix-cache hit rates across both **NVIDIA DGX Spark** and **Tenstorrent QuietBox 2** (see [`TT_PREFIX_CACHE_FIX.md`](./TT_PREFIX_CACHE_FIX.md)), and folds older turns into `summary_buffer` using a 600-token numerical archivist prompt that preserves every exact price, percentage, wave height, period, temperature, ticker, and buoy station ID verbatim.
+* **Crash-Safe Persistence:** Automatically saves `chat_cache.json` and `.chat_prompt_history` after every completed turn.
 
 ---
 
