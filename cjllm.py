@@ -10,7 +10,7 @@ extraction, rolling summary-buffer memory compression, and live TTFT/TPS telemet
 """
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import html
 import json
 import os
@@ -757,6 +757,20 @@ def fetch_top_page_table_or_excerpt(text_results: list[dict], query: str = "", m
     return fallback_excerpt[:max_chars]
 
 
+def get_dual_clock_str() -> tuple[str, str, str]:
+    """
+    Returns (today_date_str, local_clock_str, utc_clock_str) so the model and search router
+    always know both the user's local timezone clock and the current UTC/GMT clock (critical
+    for NOAA NDBC buoy timestamps and financial/market close comparisons).
+    """
+    now_local = datetime.now().astimezone()
+    now_utc = datetime.now(timezone.utc)
+    today_str = now_local.strftime("%A, %B %d, %Y")
+    local_clock_str = now_local.strftime("%A, %B %d, %Y %I:%M %p %Z")
+    utc_clock_str = now_utc.strftime("%Y-%m-%d %H:%M UTC (GMT)")
+    return today_str, local_clock_str, utc_clock_str
+
+
 def fetch_web_context(
     query: str,
     max_results: int = 5,
@@ -771,7 +785,7 @@ def fetch_web_context(
         return "Web search dependency missing. Run `pip install ddgs`."
 
     try:
-        today_str = datetime.now().strftime("%A, %B %d, %Y")
+        today_str, local_clock_str, utc_clock_str = get_dual_clock_str()
         ddgs_client = DDGS()
         rich_cards = fetch_yahoo_rich_cards(query)
 
@@ -790,7 +804,10 @@ def fetch_web_context(
         if not rich_cards and not table_excerpt and not text_results and not news_results:
             return "No web search results found."
 
-        context = f"--- CLEANED WEB SEARCH DATA (Retrieved {today_str}) FOR QUERY: '{query}' ---\n"
+        context = (
+            f"--- CLEANED WEB SEARCH DATA (Retrieved Local: {local_clock_str} | Current UTC/GMT: {utc_clock_str}) "
+            f"FOR QUERY: '{query}' ---\n"
+        )
         valid_count = 0
 
         # Prepend rich cards (e.g., live closing prices, after-hours quotes, key stats)
@@ -854,22 +871,52 @@ def fetch_web_context(
 def determine_search_query(user_input: str, history: list) -> str | None:
     """
     Fast, context-aware classification pass:
+    - Deterministically skips pure coding/math/physics prompts that don't request live external lookup.
     - Injects today's system date so 'current'/'today'/'latest' queries use the real year (not training cutoff).
-    - Uses recent conversation turns to resolve pronouns ('their', 'it', 'they').
+    - Uses up to the last 3 conversation turn pairs (600 chars/turn) + extracted station/ticker IDs
+      to resolve multi-hop pronouns ('that buoy', 'the second one', 'their', 'it').
     - Automatically adapts to the active MODEL_PROFILE (skipping CoT when supported).
     """
-    today_str = datetime.now().strftime("%A, %B %d, %Y")
-    recent_turns = history[1:][-4:]  # Up to the last 2 user/assistant pairs
+    u_lower = user_input.lower().strip()
+
+    # Fast deterministic guard against pure coding / math / textbook physics false positives
+    is_pure_code_or_math = (
+        re.search(
+            r"\b(write\s+a\s+(?:python|bash|c\+\+|rust|javascript|js|sql|html)\b|write\s+a\s+(?:script|function|program|class)\b|implement\s+a\s+function|electric\s+current\s+in\s+a\s+circuit|ohm'?s\s+law|solve\s+for\s+[a-z]\b|derivative\s+of\b|integrate\b)",
+            u_lower,
+        )
+        and not re.search(r"\b(search\s+the\s+web|pull\s+live|noaa|ndbc|buoy\s+\d{5}|yahoo\s+finance)\b", u_lower)
+    )
+    if is_pure_code_or_math:
+        return None
+
+    today_str, _, _ = get_dual_clock_str()
+    recent_turns = history[1:][-6:]  # Up to the last 3 user/assistant pairs
     context_lines = []
+    recent_buoy_matches: list[tuple[str, str]] = []  # (station_id, surrounding_clause)
+
     for msg in recent_turns:
         role_label = "User" if msg.get("role") == "user" else "Assistant"
-        snippet = msg.get("content", "")[:250].replace("\n", " ")
+        raw_content = msg.get("content", "")
+        snippet = raw_content[:600].replace("\n", " ")
         context_lines.append(f"{role_label}: {snippet}")
+        for m_b in re.finditer(r"([^.!\n]{0,45}\b(46\d{3}|41\d{3}|42\d{3}|44\d{3}|51\d{3})\b[^.!\n]{0,65})", raw_content):
+            clause = clean_text(m_b.group(1))
+            st_id = m_b.group(2)
+            if all(st_id != existing_id for existing_id, _ in recent_buoy_matches):
+                recent_buoy_matches.append((st_id, clause))
+
+    entity_hint = ""
+    if recent_buoy_matches:
+        entity_hint = "\nReferenced NOAA Buoy Stations in Context: " + " ; ".join(
+            f"Station {sid} ({cl})" for sid, cl in recent_buoy_matches
+        )
 
     if context_lines:
         eval_input = (
             "Recent Conversation Context:\n"
             + "\n".join(context_lines)
+            + entity_hint
             + f"\n\nLatest User Prompt: {user_input}"
         )
     else:
@@ -883,11 +930,12 @@ def determine_search_query(user_input: str, history: list) -> str | None:
                     f"You are a search intent evaluator. Today's date is {today_str}.\n"
                     "Determine if the Latest User Prompt requires real-time web search data, "
                     "stock prices, financial quotes, rankings/tables, recent news, current weather, surf/swell/tide/buoy reports, specific URLs/repositories, product availability, or external specs.\n"
-                    "- Use Recent Conversation Context to resolve pronouns, implicit topic references (e.g., 'for today only instead'), or when previous turns failed to provide the requested data.\n"
+                    "- Use Recent Conversation Context to resolve pronouns, implicit topic references (e.g., 'for today only instead', 'that buoy', 'the second one'), or when previous turns failed to provide the requested data.\n"
+                    "- When Recent Conversation Context contains a specific 5-digit NOAA buoy station ID (e.g., 46221, 46054, 46218) that matches the buoy referenced by the user, ALWAYS include that exact 5-digit station ID (e.g. 'NOAA buoy 46054 wave height water temp') in your search query.\n"
                     f"- When the user asks for 'current', 'latest', or 'today', use the current date/year ({today_str}) in your search query (NEVER use 2023 or 2024).\n"
                     "- If the user asks to pull data, search, update, verify, or narrow a previous real-time data request (such as 'for today only instead'), ALWAYS output a search query combining the topic from Recent Conversation Context with the Latest User Prompt.\n"
                     "- If search IS NOT needed (math, coding, reasoning, established general knowledge, or follow-up analysis of facts already stated), reply ONLY with 'NONE'.\n"
-                    "- If search IS needed, reply ONLY with a concise 2-8 word web search query (NO explanations or preamble)."
+                    "- If search IS needed, reply ONLY with a concise 2-10 word web search query (NO explanations or preamble)."
                 ),
             },
             {"role": "user", "content": eval_input},
@@ -926,7 +974,6 @@ def determine_search_query(user_input: str, history: list) -> str | None:
             phrase in lower_q
             for phrase in ("to determine", "i'll analyze", "i will analyze", "the user is asking", "user's request")
         ):
-            # Fallback: extract clean keywords from user_input
             cleaned_fallback = re.sub(
                 r"\b(show me|the|with|for|create|a|table|this|please|format|in|go|and|pull|information|from|publically|available|data|on)\b",
                 " ",
@@ -934,9 +981,27 @@ def determine_search_query(user_input: str, history: list) -> str | None:
                 flags=re.I,
             )
             cleaned_fallback = re.sub(r"\s+", " ", cleaned_fallback).strip()
-            return cleaned_fallback[:80] if cleaned_fallback else user_input[:80]
+            res_text = cleaned_fallback[:80] if cleaned_fallback else user_input[:80]
 
-        return res_text.replace('"', "").replace("'", "")
+        res_text = res_text.replace('"', "").replace("'", "")
+
+        # Post-processing: if query is about a buoy from recent context but lacks the 5-digit ID, attach the matching ID
+        if recent_buoy_matches and "buoy" in res_text.lower() and not re.search(r"\b\d{5}\b", res_text):
+            q_words = set(re.findall(r"[a-z]{4,}", (res_text + " " + " ".join(context_lines[-2:])).lower()))
+            best_id = None
+            best_overlap = 0
+            for sid, cl in recent_buoy_matches:
+                cl_words = set(re.findall(r"[a-z]{4,}", cl.lower())) - {"station", "located", "buoy", "near"}
+                overlap = len(q_words & cl_words)
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_id = sid
+            if not best_id and len(recent_buoy_matches) == 1:
+                best_id = recent_buoy_matches[0][0]
+            if best_id:
+                res_text = f"NOAA buoy {best_id} {res_text}"
+
+        return res_text
     except Exception:
         return None
 
@@ -1003,9 +1068,10 @@ if not start_file:
 
 conversation_history, summary_buffer = re_hydrate_cache(start_file)
 
-CURRENT_DATE_STR = datetime.now().strftime("%A, %B %d, %Y")
+CURRENT_DATE_STR, CURRENT_LOCAL_CLOCK_STR, CURRENT_UTC_CLOCK_STR = get_dual_clock_str()
 BASE_SYSTEM_PROMPT = (
-    f"You are an intelligent, concise AI assistant. Today's date is {CURRENT_DATE_STR}. "
+    f"You are an intelligent, concise AI assistant. Today's date is {CURRENT_DATE_STR} "
+    f"(Local Time: {CURRENT_LOCAL_CLOCK_STR} | UTC/GMT Time: {CURRENT_UTC_CLOCK_STR}). "
     "Prioritize answering the user's latest message directly and accurately, "
     "while using prior conversation turns to resolve follow-up references and maintain continuity. "
     "Treat the Prior Conversation Summary Buffer as background context. "
