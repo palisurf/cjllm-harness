@@ -250,7 +250,9 @@ def detect_model_profile(openai_client: OpenAI, model_override: str | None = Non
             temperature=0.0,
             max_tokens=3,
         )
-        probe_text = probe_resp.choices[0].message.content or ""
+        msg = probe_resp.choices[0].message
+        probe_text = msg.content or ""
+        probe_reasoning = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None)
         if "</think>" in probe_text:
             return {
                 "model_id": model_id,
@@ -262,6 +264,20 @@ def detect_model_profile(openai_client: OpenAI, model_override: str | None = Non
                 "think_close": "</think>",
                 "no_think_prefill": "<think>\nI have reviewed the context and will now provide a direct, accurate response.\n</think>\n\n",
                 "utility_prefill": "<think>\nI have evaluated the input and will output only the required result.\n</think>\n\n",
+                "no_think_stop_ids": None,
+                "think_stop_ids": None,
+            }
+        if probe_reasoning is not None or any(tag in model_lower for tag in ("qwen3.8", "qwen3.6", "qwen3.5")):
+            return {
+                "model_id": model_id,
+                "mode": "vllm_reasoning_parser",
+                "description": "vLLM Native Reasoning Parser (chat_template_kwargs.enable_thinking)",
+                "max_model_len": max_model_len,
+                "max_gen_tokens": max_gen_tokens,
+                "think_open": "<think>\n",
+                "think_close": "</think>",
+                "no_think_prefill": None,
+                "utility_prefill": None,
                 "no_think_stop_ids": None,
                 "think_stop_ids": None,
             }
@@ -302,6 +318,13 @@ def prepare_request_messages_and_extra(
     """
     req_messages = [dict(m) for m in messages]
     mode = MODEL_PROFILE["mode"]
+
+    if mode == "vllm_reasoning_parser":
+        enable_think = bool(use_thinking and not is_utility_call)
+        extra: dict = {"chat_template_kwargs": {"enable_thinking": enable_think}}
+        if not is_utility_call:
+            extra["repetition_penalty"] = 1.05
+        return req_messages, extra
 
     if mode in ("deepseek_qwen3_bridge", "native_think"):
         if use_thinking and not is_utility_call:
@@ -2729,10 +2752,29 @@ while __name__ == "__main__":
             ) as live:
                 for chunk in stream:
                     if chunk.choices and len(chunk.choices) > 0:
-                        content = chunk.choices[0].delta.content or ""
+                        delta = chunk.choices[0].delta
+                        r_tok = getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None) or ""
+                        content = delta.content or ""
+                        if r_tok:
+                            if first_token_time is None:
+                                first_token_time = time.perf_counter()
+                            if use_thinking:
+                                if not full_response.startswith("<think>"):
+                                    full_response = "<think>\n" + full_response
+                                full_response += r_tok
+                                prog_streamer.step(live, format_thinking_markdown(full_response))
+                            else:
+                                prog_streamer.token_count += 1
+                                live.update(
+                                    prog_streamer.make_status_line(
+                                        prefix_label="⚡ Reasoning",
+                                    )
+                                )
                         if content:
                             if first_token_time is None:
                                 first_token_time = time.perf_counter()
+                            if use_thinking and full_response.startswith("<think>") and "</think>" not in full_response:
+                                full_response += "\n</think>\n\n"
                             full_response += content
                             if use_thinking:
                                 prog_streamer.step(live, format_thinking_markdown(full_response))
