@@ -1,6 +1,6 @@
 # CJ vLLM Search Harness (`cjllm-search-harness`)
 
-A lightweight, single-file, zero-framework Python CLI inference and search-augmented generation harness ([`cjllm.py`](./cjllm.py)) built for **OpenAI-compatible `vLLM` endpoints** running on local AI workstations and accelerator appliances (including **Tenstorrent QuietBox 2 (`p300x2` Blackhole)** and **NVIDIA DGX Spark**).
+A high performance, single-file, zero-framework Python CLI inference and search-augmented generation harness ([`cjllm.py`](./cjllm.py)) built for **OpenAI-compatible `vLLM` endpoints** running on local AI workstations and accelerator appliances (including **Tenstorrent QuietBox 2 (`p300x2` Blackhole)** and **NVIDIA DGX Spark**).
 
 **Author:** Christopher Jones ([@palisurf](https://github.com/palisurf))  
 **Repository:** [https://github.com/palisurf/cjllm-harness](https://github.com/palisurf/cjllm-harness)
