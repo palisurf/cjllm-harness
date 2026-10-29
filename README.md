@@ -111,7 +111,7 @@ User Input
    ▼
 3. Payload Construction & Model-Profile Adaptation (`prepare_request_messages_and_extra`)
    • Single merged system prompt (`BASE_SYSTEM_PROMPT` with False-Premise Guard + `summary_buffer`)
-   • Verbatim sliding window (`MAX_PAIRS = 30` pairs / `~20,000` tokens high-water mark, batch-evicting `8` pairs)
+   • 3-tier context-aware verbatim sliding window (`MAX_PAIRS = 15/30/40` pairs, `MAX_VERBATIM_TOKENS = 10K/20K/26K` tokens, batch-evicting `5/8/10` pairs based on `max_model_len`)
    • Active user turn (with 2026 web data + chronological table & exhaustive-list synthesis rules)
    • Automatic tokenizer prefill & stop-token adaptation based on `MODEL_PROFILE`
    │
@@ -125,7 +125,7 @@ User Input
 5. Sanitization, Rolling Batch Memory Compression & Crash-Safe Auto-Save
    • Strips CoT blocks and residual special tokens (`strip_thinking_and_dedup`)
    • Quality gate discards degenerate/corrupted responses before they pollute history
-   • Batch-evicts 8 oldest turn pairs when exceeding `MAX_PAIRS = 30` (`compress_memory_batch`)
+   • Batch-evicts `EVICT_BATCH_PAIRS` (`5/8/10`) oldest turn pairs when exceeding `MAX_PAIRS` or `MAX_VERBATIM_TOKENS` (`compress_memory_batch`)
    • Auto-saves `chat_cache.json` and `.chat_prompt_history` after every completed turn
 ```
 
@@ -273,13 +273,14 @@ python3 cjllm.py
 ```
 
 ### Optional CLI Arguments
+By default, `--max-pairs`, `--max-verbatim-tokens`, and `--evict-batch` are **auto-scaled from the model's `max_model_len`** (`15 / 10,000 / 5` for $\le 32\text{K}$ models; `30 / 20,000 / 8` for $64\text{K}–131\text{K}$ models; `40 / 26,000 / 10` for $\ge 256\text{K}$ models like `Qwen/Qwen3.8-27B`). You can optionally override any of them via CLI flags:
 ```bash
 python3 cjllm.py \
   --url http://localhost:8000/v1 \
-  --model Qwen/Qwen3-32B \
-  --max-pairs 30 \
-  --max-verbatim-tokens 20000 \
-  --evict-batch 8 \
+  --model Qwen/Qwen3.8-27B \
+  --max-pairs 40 \
+  --max-verbatim-tokens 26000 \
+  --evict-batch 10 \
   --tz America/Los_Angeles \
   --cache chat_cache.json \
   --think
