@@ -72,20 +72,20 @@ parser.add_argument(
 parser.add_argument(
     "--max-pairs",
     type=int,
-    default=30,
-    help="High-water mark of verbatim user/assistant turn pairs before batch compression (default: 30)",
+    default=None,
+    help="High-water mark of verbatim user/assistant turn pairs before batch compression (default: auto-scaled by model context length: 15/30/40)",
 )
 parser.add_argument(
     "--max-verbatim-tokens",
     type=int,
-    default=20000,
-    help="High-water mark of approximate verbatim history tokens before batch compression (default: 20000)",
+    default=None,
+    help="High-water mark of approximate verbatim history tokens before batch compression (default: auto-scaled by model context length: 10000/20000/26000)",
 )
 parser.add_argument(
     "--evict-batch",
     type=int,
-    default=8,
-    help="Number of oldest turn pairs to fold in a single batch when high-water mark is reached (default: 8)",
+    default=None,
+    help="Number of oldest turn pairs to fold in a single batch when high-water mark is reached (default: auto-scaled by model context length: 5/8/10)",
 )
 parser.add_argument(
     "--cache",
@@ -140,9 +140,6 @@ client = OpenAI(
 
 DEFAULT_CACHE_FILE = args.cache
 COMMAND_HISTORY_FILE = ".chat_prompt_history"
-MAX_PAIRS = args.max_pairs
-MAX_VERBATIM_TOKENS = args.max_verbatim_tokens
-EVICT_BATCH_PAIRS = max(1, min(args.evict_batch, max(1, MAX_PAIRS // 2)))
 
 # --- DEEPSEEK-R1-DISTILL / QWEN3 TOKENIZER BRIDGE CONSTANTS ---
 # When a container serves DeepSeek-R1-Distill-Qwen-32B weights under the Qwen/Qwen3-32B tokenizer:
@@ -302,6 +299,42 @@ def detect_model_profile(openai_client: OpenAI, model_override: str | None = Non
 
 MODEL_PROFILE = detect_model_profile(client, args.model)
 MODEL_NAME = MODEL_PROFILE["model_id"]
+
+
+def resolve_memory_tier(
+    max_model_len: int,
+    max_pairs_arg: int | None,
+    max_tokens_arg: int | None,
+    evict_batch_arg: int | None,
+) -> tuple[int, int, int]:
+    """
+    Auto-scales the verbatim memory window across 3 hardware-aware tiers based on the model's
+    context length (`max_model_len`) while staying safely below the 32K prefill compilation cliff:
+      - Tier 1 (<= 32K context):     15 pairs, 10,000 verbatim tokens, evict batch 5
+      - Tier 2 (32K - 128K context): 30 pairs, 20,000 verbatim tokens, evict batch 8
+      - Tier 3 (>= 256K context):    40 pairs, 26,000 verbatim tokens, evict batch 10
+    Explicit CLI flags (--max-pairs, --max-verbatim-tokens, --evict-batch) override the tier defaults.
+    """
+    if max_model_len <= 32768:
+        default_pairs, default_tokens, default_evict = 15, 10000, 5
+    elif max_model_len >= 262144:
+        default_pairs, default_tokens, default_evict = 40, 26000, 10
+    else:
+        default_pairs, default_tokens, default_evict = 30, 20000, 8
+
+    resolved_pairs = max_pairs_arg if max_pairs_arg is not None else default_pairs
+    resolved_tokens = max_tokens_arg if max_tokens_arg is not None else default_tokens
+    raw_evict = evict_batch_arg if evict_batch_arg is not None else default_evict
+    resolved_evict = max(1, min(raw_evict, max(1, resolved_pairs // 2)))
+    return resolved_pairs, resolved_tokens, resolved_evict
+
+
+MAX_PAIRS, MAX_VERBATIM_TOKENS, EVICT_BATCH_PAIRS = resolve_memory_tier(
+    MODEL_PROFILE["max_model_len"],
+    args.max_pairs,
+    args.max_verbatim_tokens,
+    args.evict_batch,
+)
 
 
 def prepare_request_messages_and_extra(
@@ -2478,7 +2511,8 @@ if __name__ == "__main__":
             f"[dim]Model:[/dim] [bold white]{MODEL_NAME}[/bold white]\n"
             f"[dim]Endpoint:[/dim] [cyan]{args.url}[/cyan] | "
             f"[dim]Detected Profile:[/dim] [bold green]{MODEL_PROFILE['description']}[/bold green] | "
-            f"[dim]Context Limit:[/dim] [cyan]{MODEL_PROFILE['max_model_len']:,} tokens[/cyan]",
+            f"[dim]Context Limit:[/dim] [cyan]{MODEL_PROFILE['max_model_len']:,} tokens[/cyan] | "
+            f"[dim]Memory Window:[/dim] [cyan]{MAX_PAIRS} pairs (~{MAX_VERBATIM_TOKENS:,} tok, evict {EVICT_BATCH_PAIRS})[/cyan]",
             title="[bold cyan]cjllm — Model-Agnostic vLLM Search & Inference Harness[/bold cyan]",
             subtitle="[dim]CJ vLLM Search Harness (@palisurf) • github.com/palisurf/cjllm-harness[/dim]",
             border_style="cyan",
