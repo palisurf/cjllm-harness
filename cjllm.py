@@ -197,6 +197,22 @@ def detect_model_profile(openai_client: OpenAI, model_override: str | None = Non
             "think_stop_ids": None,
         }
 
+    # Fast path for OpenAI Harmony reasoning models (openai/gpt-oss-120b, openai/gpt-oss-20b)
+    if "gpt-oss" in model_lower:
+        return {
+            "model_id": model_id,
+            "mode": "vllm_reasoning_parser",
+            "description": "vLLM Harmony Reasoning Parser (reasoning_effort low/medium)",
+            "max_model_len": max_model_len,
+            "max_gen_tokens": max_gen_tokens,
+            "think_open": "<think>\n",
+            "think_close": "</think>",
+            "no_think_prefill": None,
+            "utility_prefill": None,
+            "no_think_stop_ids": None,
+            "think_stop_ids": None,
+        }
+
     # Probe 1: Check if model closes <|box_start|> with <|box_end|> (DeepSeek-R1-Distill on Qwen3 tokenizer)
     try:
         probe_resp = openai_client.chat.completions.create(
@@ -354,7 +370,10 @@ def prepare_request_messages_and_extra(
 
     if mode == "vllm_reasoning_parser":
         enable_think = bool(use_thinking and not is_utility_call)
-        extra: dict = {"chat_template_kwargs": {"enable_thinking": enable_think}}
+        if "gpt-oss" in MODEL_PROFILE["model_id"].lower():
+            extra: dict = {"reasoning_effort": "medium" if enable_think else "low"}
+        else:
+            extra = {"chat_template_kwargs": {"enable_thinking": enable_think}}
         if not is_utility_call:
             extra["repetition_penalty"] = 1.05
         return req_messages, extra
@@ -1827,7 +1846,7 @@ def determine_search_query(user_input: str, history: list) -> str | None:
             "model": MODEL_NAME,
             "messages": req_messages,
             "temperature": 0.0,
-            "max_tokens": 55,
+            "max_tokens": 140 if "gpt-oss" in MODEL_NAME.lower() else 55,
         }
         if extra_params:
             create_kwargs["extra_body"] = extra_params
@@ -2098,7 +2117,7 @@ def plan_parallel_sections(user_input: str) -> list[str] | None:
             "model": MODEL_NAME,
             "messages": req_messages,
             "temperature": 0.0,
-            "max_tokens": 110,
+            "max_tokens": 200 if "gpt-oss" in MODEL_NAME.lower() else 110,
         }
         if extra_params:
             create_kwargs["extra_body"] = extra_params
